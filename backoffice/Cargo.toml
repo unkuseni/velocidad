@@ -1,0 +1,128 @@
+[package]
+name = "backoffice"
+version = "0.1.0"
+edition = "2021"
+authors = ["Adeoye Olaseni <dev@unkuseni.xyz>"]
+description = "High-performance multi-chain trading bot backend"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/unkuseni/velocidad"
+readme = "README.md"
+
+[features]
+default = ["postgres", "redis", "telegram", "ethereum"]
+postgres = ["sqlx/postgres", "sqlx/runtime-tokio-native-tls"]
+redis = ["redis", "bb8-redis"]
+telegram = ["teloxide"]
+ethereum = ["ethers", "alloy"]
+solana = ["solana-client", "solana-sdk"]
+kafka = ["rdkafka"]
+rabbitmq = ["lapin"]
+jaeger = ["tracing-jaeger"]
+prometheus = ["metrics-exporter-prometheus"]
+full = ["postgres", "redis", "telegram", "ethereum", "solana", "kafka", "rabbitmq", "jaeger", "prometheus"]
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1.0", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-br", "limit"] }
+
+# Telegram bot
+teloxide = { version = "0.12", optional = true, features = ["auto-send", "ctrlc_handler"] }
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "macros", "migrate"], optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+
+# Caching and message queue
+redis = { version = "0.23", optional = true }
+bb8-redis = { version = "0.12", optional = true }
+lapin = { version = "3", optional = true, features = ["rustls"] }
+rdkafka = { version = "0.36", optional = true, features = ["ssl"] }
+
+# Blockchain
+ethers = { version = "2.0", optional = true, features = ["rustls", "ws"] }
+alloy = { version = "0.2", optional = true }
+solana-client = { version = "1.17", optional = true }
+solana-sdk = { version = "1.17", optional = true }
+
+# WebSocket
+tokio-tungstenite = { version = "0.20", features = ["rustls-tls"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_with = "3.0"
+
+# Configuration
+dotenv = "0.15"
+figment = { version = "0.10", features = ["json", "yaml", "env"] }
+config = "0.13"
+
+# Cryptography and security
+jsonwebtoken = "9.0"
+argon2 = "0.5"
+rand = "0.8"
+aes-gcm = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+
+# Utilities
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.22"
+tracing-jaeger = { version = "0.2", optional = true }
+opentelemetry = { version = "0.22", features = ["rt-tokio"] }
+opentelemetry-jaeger = { version = "0.22", optional = true }
+metrics = "0.22"
+metrics-exporter-prometheus = { version = "0.13", optional = true }
+prometheus = { version = "0.13", optional = true }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+time = "0.3"
+bigdecimal = { version = "0.4", features = ["serde"] }
+rust_decimal = { version = "1.33", features = ["serde"] }
+futures = "0.3"
+async-trait = "0.1"
+hex = "0.4"
+base64 = "0.21"
+url = "2.0"
+reqwest = { version = "0.11", features = ["json", "stream"] }
+http = "1.0"
+http-body = "1.0"
+mime = "0.3"
+bytes = "1.0"
+
+# CLI (for admin tools)
+clap = { version = "4.0", features = ["derive", "env"] }
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full", "test-util"] }
+tempfile = "3.0"
+testcontainers = { version = "0.15", features = ["redis", "postgres"] }
+wiremock = "0.5"
+assert_matches = "1.5"
+
+[build-dependencies]
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "migrate"] }
+
+[[bin]]
+name = "velocidad-api"
+path = "src/bin/api.rs"
+
+[[bin]]
+name = "velocidad-bot"
+path = "src/bin/bot.rs"
+
+[[bin]]
+name = "velocidad-engine"
+path = "src/bin/engine.rs"
+
+[[bin]]
+name = "velocidad-worker"
+path = "src/bin/worker.rs"
