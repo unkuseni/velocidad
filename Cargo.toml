@@ -1,0 +1,10 @@
+[package]
+name = "velocidad"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+authors = ["Adeoye Olaseni <dev@unkuseni.xyz>"]
+description = "High-performance multi-chain telegram trading bot"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/unkuseni/velocidad"
+readme = "README.md"
