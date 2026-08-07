@@ -1,1 +1,5 @@
 target
+.env
+velocidad.db
+velocidad.key
+*.log
