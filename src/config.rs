@@ -66,6 +66,11 @@ pub struct Config {
     /// address is used as the fee payer and SPL delegate.
     #[serde(default)]
     pub sponsor_solana_key: Option<String>,
+
+    /// Optional bearer token protecting the HTTP API (/api/v1/*). When unset,
+    /// the API runs open (dev mode) with a startup warning.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 fn default_chain() -> String {
@@ -104,6 +109,7 @@ impl Config {
                 "HONEYPOT_API_KEY",
                 "SPONSOR_KEY",
                 "SPONSOR_SOLANA_KEY",
+                "API_KEY",
             ]))
             .merge(Env::prefixed("VELOCIDAD_").split("_"))
             .extract()?;

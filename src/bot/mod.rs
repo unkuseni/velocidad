@@ -154,7 +154,7 @@ async fn dispatch_command(
         }
         Err(err) => {
             tracing::warn!(error = %err, "command failed");
-            let _ = bot.send_message(msg.chat.id, format!("❌ {err}")).await;
+            let _ = bot.send_message(msg.chat.id, format!("❌ {}", esc(&err.to_string()))).await;
         }
     }
     Ok(())
@@ -595,7 +595,7 @@ async fn cmd_sell(
     let wallet = wallet_for_chain(state, user_id, chain).await?;
     let slippage = user_slippage(state, user_id).await?;
 
-    let position = repo::get_position(state.db.conn(), user_id, &token).await?;
+    let position = repo::get_position(state.db.conn(), user_id, chain.id, &token).await?;
     let live = !state.config.paper_trading;
     let qty = if qty_arg == "all" || qty_arg == "max" {
         if live {
@@ -780,7 +780,7 @@ async fn cmd_price(state: &AppState, msg: &Message, token_arg: &str) -> Result<S
          Volume 24h: {}\n\
          Change 24h: <b>{:+.2}%</b>\n\
          Risk: <b>{}/100</b> {}\n\n{}",
-        quote.name,
+        esc(&quote.name),
         short_addr(&token),
         chain.id,
         format_price(quote.price_usd),
@@ -823,7 +823,7 @@ async fn cmd_token(state: &AppState, msg: &Message, token_arg: &str) -> Result<S
          FDV: {}\n\
          Best pair: {} on {} · source: <b>{}</b>\n\
          🔗 <a href=\"{}\">View on DexScreener</a>",
-        quote.name,
+        esc(&quote.name),
         short_addr(&token),
         chain.id,
         age,
@@ -857,8 +857,8 @@ async fn cmd_scan(state: &AppState, msg: &Message, token_arg: &str) -> Result<St
          Data: {}\n\n{}",
         chain.id,
         short_addr(&token),
-        report.name,
-        report.symbol,
+        esc(&report.name),
+        esc(&report.symbol),
         report.risk_score,
         risk_badge(report.risk_score),
         if report.is_honeypot { "🚫 HONEYPOT" }
@@ -976,13 +976,13 @@ async fn cmd_find(state: &AppState, msg: &Message, q: &str) -> Result<String> {
     let _ = ensure_user(state, msg).await?;
     let results = state.market.search(q).await;
     if results.is_empty() {
-        return Ok(format!("🔍 No results for <code>{}</code>. Try a ticker like /find pepe.", sanitize_html(q)));
+        return Ok(format!("🔍 No results for <code>{}</code>. Try a ticker like /find pepe.", esc(q)));
     }
-    let mut s = format!("🔍 <b>Search: {}</b>\n\n", sanitize_html(q));
+    let mut s = format!("🔍 <b>Search: {}</b>\n\n", esc(q));
     for r in results.iter().take(10) {
         s.push_str(&format!(
             "<b>{}</b> · {} · <code>{}</code>\n",
-            r.symbol, r.chain, r.address
+            esc(&r.symbol), esc(&r.chain), r.address
         ));
         s.push_str(&format!(
             "   {} · liq {} · vol {} · 24h <b>{:+.1}%</b>\n",
@@ -1124,8 +1124,29 @@ async fn sponsorship_off(
             Ok(format!("🪪 Delegation cleared ({}). 🔗 {}", chain.id, chain.explorer_link(&hash)))
         }
         crate::chains::ChainKind::Solana => {
+            let Some(sp) = state.solana.sponsor.as_ref() else {
+                repo::set_setting(state.db.conn(), user_id, &setting_key, "off").await?;
+                return Ok("🪐 Solana sponsorship OFF (no sponsor configured).".to_string());
+            };
+            let blockhash = state.solana.latest_blockhash(chain).await?;
+            let owner: [u8; 32] = bs58::decode(wallet.address.trim()).into_vec().context("bad wallet")?.try_into().map_err(|_| anyhow::anyhow!("bad pubkey"))?;
+            let balances = state.solana.spl_balances(chain, &wallet.address).await?;
+            let mut txs: Vec<String> = Vec::new();
+            for b in balances.iter().filter(|b| b.amount > 0.0) {
+                let account_bytes: [u8; 32] = bs58::decode(b.account.trim()).into_vec().ok().and_then(|v| v.try_into().ok()).context("bad token account")?;
+                let (message, signers) = crate::solana::build_sponsored_revoke(&owner, &account_bytes, &sp.pubkey, &blockhash);
+                let sig = state.solana.send_sponsored(chain, &message, &signers, &[&sp.seed, secret]).await?;
+                txs.push(format!("  ✅ revoked {} · <code>{}</code>", b.mint, short_addr(&sig)));
+            }
             repo::set_setting(state.db.conn(), user_id, &setting_key, "off").await?;
-            Ok("🪐 Solana sponsorship OFF (delegates kept — revoke manually or re-run /sponsor on with a zero allowance).".to_string())
+            if txs.is_empty() {
+                Ok("🪐 Solana sponsorship OFF (no delegated balances found).".to_string())
+            } else {
+                Ok(format!(
+                    "🪐 <b>Solana sponsorship OFF</b> — delegates revoked\n\n{}\n\nℹ️ The sponsor can no longer move your tokens.",
+                    txs.join("\n")
+                ))
+            }
         }
     }
 }
@@ -1208,7 +1229,9 @@ async fn sponsor_account_for(state: &AppState, chain: &Chain) -> Result<String> 
     Ok(repo::get_setting(state.db.conn(), 0, &format!("sponsor_account:{}", chain.id)).await?.unwrap_or_default())
 }
 
-fn sanitize_html(s: &str) -> String {
+/// Escape a string for Telegram HTML messages (external data may contain
+/// markup — token symbols/names come from DexScreener, errors from RPCs).
+fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
@@ -1443,7 +1466,7 @@ async fn record_live_order(
     let conn = state.db.conn();
     let tx = conn.transaction().await?;
     if side == "sell" {
-        let _ = repo::reduce_position(&tx, user_id, token, amount_in, price).await;
+        let _ = repo::reduce_position(&tx, user_id, chain.id, token, amount_in, price).await;
     } else {
         repo::add_to_position(&tx, user_id, wallet_id, chain.id, token, amount_out, price).await?;
     }
@@ -1471,9 +1494,8 @@ async fn record_live_order(
 }
 
 async fn token_symbol(state: &AppState, chain: &Chain, token: &str) -> String {
-    let _ = chain;
-    match repo::get_token(state.db.conn(), token).await.ok().flatten() {
-        Some(t) => t.symbol.unwrap_or_else(|| short_addr(token)),
+    match repo::get_token(state.db.conn(), chain.id, token).await.ok().flatten() {
+        Some(t) => t.symbol.map(|s| esc(&s)).unwrap_or_else(|| short_addr(token)),
         None => short_addr(token),
     }
 }
@@ -1488,7 +1510,7 @@ fn fmt_buy_paper(receipt: &crate::trading::TradeReceipt, chain: &Chain, side: &s
          Price: <b>{}</b>\n\
          Spent: <b>{:.6} {}</b>\n\
          Position: {} @ {}\n\
-         Slippage: {:.2}%{}",
+         Slippage: {:.2}%{}{}",
         side.to_uppercase(),
         chain.id,
         short_addr(&o.token_address),
@@ -1500,7 +1522,8 @@ fn fmt_buy_paper(receipt: &crate::trading::TradeReceipt, chain: &Chain, side: &s
         format_qty(receipt.position_quantity),
         format_price(receipt.position_avg_price),
         o.slippage * 100.0,
-        alert_note(receipt.alerts_fired)
+        alert_note(receipt.alerts_fired),
+        sim_note(receipt.price_source)
     )
 }
 
@@ -1512,7 +1535,7 @@ fn fmt_sell_paper(receipt: &crate::trading::TradeReceipt, chain: &Chain) -> Stri
          Qty: <b>{}</b>\n\
          Price: <b>{}</b>\n\
          Proceeds: <b>{:.6} {}</b>\n\
-         Realized PnL: <b>{}</b>{}",
+         Realized PnL: <b>{}</b>{}{}",
         chain.id,
         short_addr(&o.token_address),
         receipt.token_symbol.clone().unwrap_or_default(),
@@ -1521,7 +1544,8 @@ fn fmt_sell_paper(receipt: &crate::trading::TradeReceipt, chain: &Chain) -> Stri
         o.amount_out.unwrap_or(0.0),
         chain.native,
         pnl_str(receipt.realized_pnl.unwrap_or(0.0), chain.native),
-        alert_note(receipt.alerts_fired)
+        alert_note(receipt.alerts_fired),
+        sim_note(receipt.price_source)
     )
 }
 
@@ -1557,11 +1581,31 @@ fn checks_text(report: &TokenReport) -> String {
         .join("\n")
 }
 
+fn sim_note(source: &'static str) -> String {
+    if source == "simulator" {
+        "\n⚠️ <b>No live market data for this token — price is simulated.</b>".to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn alert_note(fired: i64) -> String {
     if fired > 0 {
         format!("\n🔔 {fired} price alert(s) fired!")
     } else {
         String::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn esc_escapes_html() {
+        assert_eq!(esc("<b>bold</b> & x"), "&lt;b&gt;bold&lt;/b&gt; &amp; x");
+        assert_eq!(esc("plain"), "plain");
+        assert_eq!(esc("a<b"), "a&lt;b");
     }
 }
 

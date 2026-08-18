@@ -68,7 +68,7 @@ async fn match_limits(state: &AppState, bot: &Bot) -> anyhow::Result<usize> {
                     format!(
                         "⏳ <b>LIMIT ORDER FILLED</b>\n\nToken: <code>{}</code> ({})\nBuy at: <b>{}</b> (filled {})\nQty: <b>{}</b>\nSpent: <b>{:.6} {}</b>\n{}\n\n{}",
                         market::short_addr(&order.token_address),
-                        receipt.token_symbol.clone().unwrap_or_default(),
+                        esc(&receipt.token_symbol.clone().unwrap_or_default()),
                         market::format_price(limit_price),
                         market::format_price(price),
                         market::format_qty(receipt.order.amount_out.unwrap_or(0.0)),
@@ -125,7 +125,7 @@ async fn poll_alerts(state: &AppState, bot: &Bot) -> anyhow::Result<usize> {
             format!(
                 "🔔 <b>PRICE ALERT</b>\n\nToken: <code>{}</code> ({})\nCondition: {} <b>{}</b>\nCurrent: <b>{}</b>\nSource: {}",
                 market::short_addr(&alert.token_address),
-                quote.symbol,
+                esc(&quote.symbol),
                 if alert.condition == "above" { "↑ above" } else { "↓ below" },
                 market::format_price(alert.target_price),
                 market::format_price(price),
@@ -135,6 +135,11 @@ async fn poll_alerts(state: &AppState, bot: &Bot) -> anyhow::Result<usize> {
         .await;
     }
     Ok(fired)
+}
+
+/// Escape a string for Telegram HTML messages.
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 /// Send a Telegram notification to a user; failures are logged, not fatal.

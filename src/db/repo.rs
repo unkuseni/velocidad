@@ -193,7 +193,7 @@ pub async fn upsert_token(conn: &Connection, t: &Token) -> Result<()> {
         "INSERT INTO tokens (address, network, name, symbol, decimals, risk_score,
                              is_honeypot, liquidity, last_price, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-         ON CONFLICT (address) DO UPDATE SET
+         ON CONFLICT (network, address) DO UPDATE SET
             name = COALESCE(excluded.name, tokens.name),
             symbol = COALESCE(excluded.symbol, tokens.symbol),
             risk_score = excluded.risk_score,
@@ -218,13 +218,13 @@ pub async fn upsert_token(conn: &Connection, t: &Token) -> Result<()> {
     Ok(())
 }
 
-pub async fn get_token(conn: &Connection, address: &str) -> Result<Option<Token>> {
+pub async fn get_token(conn: &Connection, network: &str, address: &str) -> Result<Option<Token>> {
     let mut rows = conn
         .query(
             "SELECT address, network, name, symbol, decimals, risk_score,
                     is_honeypot, liquidity, last_price, updated_at
-             FROM tokens WHERE address = ?1",
-            params![address],
+             FROM tokens WHERE network = ?1 AND address = ?2",
+            params![network, address],
         )
         .await?;
     let Some(row) = rows.next().await? else {
@@ -361,14 +361,15 @@ pub async fn list_orders(conn: &Connection, user_id: i64, limit: i64) -> Result<
 pub async fn get_position(
     conn: &Connection,
     user_id: i64,
+    network: &str,
     token_address: &str,
 ) -> Result<Option<Position>> {
     let mut rows = conn
         .query(
             "SELECT id, user_id, wallet_id, token_address, network, quantity,
                     avg_price, realized_pnl, updated_at
-             FROM positions WHERE user_id = ?1 AND token_address = ?2",
-            params![user_id, token_address],
+             FROM positions WHERE user_id = ?1 AND network = ?2 AND token_address = ?3",
+            params![user_id, network, token_address],
         )
         .await?;
     let Some(row) = rows.next().await? else {
@@ -426,7 +427,7 @@ pub async fn add_to_position(
     conn.execute(
         "INSERT INTO positions (user_id, wallet_id, network, token_address, quantity, avg_price, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
-         ON CONFLICT (user_id, token_address) DO UPDATE SET
+         ON CONFLICT (user_id, network, token_address) DO UPDATE SET
             quantity = positions.quantity + excluded.quantity,
             avg_price = CASE
                 WHEN positions.quantity + excluded.quantity = 0 THEN 0
@@ -441,16 +442,17 @@ pub async fn add_to_position(
     Ok(())
 }
 
-/// Remove `qty` tokens from a position; computes realized PnL. Removes the row
-/// entirely when the position reaches zero.
+/// Remove `qty` tokens from a position; computes realized PnL. The row is
+/// kept at zero quantity so realized PnL aggregates survive full closes.
 pub async fn reduce_position(
     conn: &Connection,
     user_id: i64,
+    network: &str,
     token_address: &str,
     qty: f64,
     price: f64,
 ) -> Result<f64> {
-    let Some(pos) = get_position(conn, user_id, token_address).await? else {
+    let Some(pos) = get_position(conn, user_id, network, token_address).await? else {
         bail!("no open position for this token");
     };
     if qty > pos.quantity + 1e-12 {
@@ -462,22 +464,14 @@ pub async fn reduce_position(
     }
     let realized = (price - pos.avg_price) * qty;
 
-    let remaining = pos.quantity - qty;
-    if remaining <= 1e-12 {
-        conn.execute(
-            "DELETE FROM positions WHERE user_id = ?1 AND token_address = ?2",
-            params![user_id, token_address],
-        )
-        .await?;
-    } else {
-        conn.execute(
-            "UPDATE positions SET quantity = ?3, realized_pnl = realized_pnl + ?4,
-                                   updated_at = datetime('now')
-             WHERE user_id = ?1 AND token_address = ?2",
-            params![user_id, token_address, remaining, realized],
-        )
-        .await?;
-    }
+    let remaining = (pos.quantity - qty).max(0.0);
+    conn.execute(
+        "UPDATE positions SET quantity = ?3, realized_pnl = realized_pnl + ?4,
+                               updated_at = datetime('now')
+         WHERE user_id = ?1 AND network = ?2 AND token_address = ?5",
+        params![user_id, network, remaining, realized, token_address],
+    )
+    .await?;
     Ok(realized)
 }
 

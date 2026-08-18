@@ -123,6 +123,54 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_alerts_untriggered
         ON alerts (is_triggered);
     "#,
+    // NOTE: libSQL execute() runs a single statement per migration — multi-
+    // statement strings silently execute only the first one. Each table rebuild
+    // below is therefore split into one entry per statement.
+    // Positions: scope per (user, network, token) — the same token address
+    // exists on multiple chains (e.g. WETH on Optimism + Base). Zero-quantity
+    // rows are kept so realized PnL aggregates survive full closes.
+    r#"
+    CREATE TABLE positions_v2 (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id       INTEGER NOT NULL REFERENCES users(id),
+        wallet_id     INTEGER REFERENCES wallets(id),
+        token_address TEXT NOT NULL,
+        network       TEXT NOT NULL DEFAULT 'ethereum',
+        quantity      REAL NOT NULL DEFAULT 0,
+        avg_price     REAL NOT NULL DEFAULT 0,
+        realized_pnl  REAL NOT NULL DEFAULT 0,
+        updated_at    TEXT,
+        UNIQUE (user_id, network, token_address)
+    );
+    "#,
+    r#"
+    INSERT INTO positions_v2 (id, user_id, wallet_id, token_address, network, quantity, avg_price, realized_pnl, updated_at)
+        SELECT id, user_id, wallet_id, token_address, network, quantity, avg_price, realized_pnl, updated_at FROM positions;
+    "#,
+    r#"DROP TABLE positions;"#,
+    r#"ALTER TABLE positions_v2 RENAME TO positions;"#,
+    // Tokens: (network, address) composite key.
+    r#"
+    CREATE TABLE tokens_v2 (
+        network     TEXT NOT NULL DEFAULT 'ethereum',
+        address     TEXT NOT NULL,
+        name        TEXT,
+        symbol      TEXT,
+        decimals    INTEGER DEFAULT 18,
+        risk_score  INTEGER DEFAULT 0,
+        is_honeypot INTEGER DEFAULT 0,
+        liquidity   REAL,
+        last_price  REAL,
+        updated_at  TEXT,
+        PRIMARY KEY (network, address)
+    );
+    "#,
+    r#"
+    INSERT INTO tokens_v2 (network, address, name, symbol, decimals, risk_score, is_honeypot, liquidity, last_price, updated_at)
+        SELECT network, address, name, symbol, decimals, risk_score, is_honeypot, liquidity, last_price, updated_at FROM tokens;
+    "#,
+    r#"DROP TABLE tokens;"#,
+    r#"ALTER TABLE tokens_v2 RENAME TO tokens;"#,
 ];
 
 /// Shared handle to the libSQL database. Cheap to clone (`Connection` is

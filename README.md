@@ -150,7 +150,8 @@ Start the bot, then:
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET  /health` | liveness |
+| `GET  /health` | liveness (no auth) |
+> All other endpoints require `Authorization: Bearer <API_KEY>` when `API_KEY` is set. |
 | `GET  /api/v1/chains` | supported EVM chains |
 | `GET  /api/v1/users/:telegram_id` | user, wallets, stats |
 | `GET  /api/v1/portfolio/:telegram_id` | open positions + live PnL |
@@ -204,6 +205,7 @@ src/
 | `TURSO_AUTH_TOKEN` | — | required for Turso URLs |
 | `TELOXIDE_TOKEN` | — | Telegram bot token (required) |
 | `API_PORT` | `8080` | HTTP API port |
+| `API_KEY` | — | bearer token protecting `/api/v1/*` (open dev mode with a warning when unset) |
 | `PAPER_TRADING` | `true` | simulate fills (at live prices) instead of broadcasting |
 | `LIVE_MARKET` | `true` | DexScreener live prices (offline fallback to simulator) |
 | `DEFAULT_CHAIN` | `ethereum` | default chain for chain-less commands (`solana` works too) |

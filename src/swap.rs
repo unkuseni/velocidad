@@ -112,6 +112,69 @@ struct QuoteError {
     reasons: Option<serde_json::Value>,
 }
 
+
+/// Tracks the last-used transaction nonce per (chain, signer) so concurrent
+/// commands never double-spend a nonce (which would drop one of the txs).
+/// Uses a tokio mutex so the guard may be held across the RPC fetch
+/// (std MutexGuard is !Send across await and would poison the caller futures).
+#[derive(Default)]
+pub struct NonceManager {
+    used: tokio::sync::Mutex<std::collections::HashMap<(String, String), u64>>,
+}
+
+impl NonceManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Next nonce for (chain, address): cached last-used + 1, or fetched from
+    /// the RPC when this signer hasn't broadcast yet. Serialized per key.
+    pub async fn next(&self, rpc: &RpcClient, chain: &Chain, address: &str) -> anyhow::Result<u64> {
+        let key = (chain.id.to_string(), address.to_lowercase());
+        let mut guard = self.used.lock().await;
+        if let Some(last) = guard.get(&key) {
+            let n = last + 1;
+            guard.insert(key, n);
+            return Ok(n);
+        }
+        let n = rpc.nonce(chain, address).await?;
+        guard.insert(key, n);
+        Ok(n)
+    }
+
+    /// Deterministic next-nonce from a provided fetch (unit tests).
+    #[cfg(test)]
+    pub fn next_with(&self, chain: &Chain, address: &str, fetched: u64) -> u64 {
+        let key = (chain.id.to_string(), address.to_lowercase());
+        let mut guard = self.used.blocking_lock();
+        if let Some(last) = guard.get(&key) {
+            let n = last + 1;
+            guard.insert(key, n);
+            n
+        } else {
+            guard.insert(key, fetched);
+            fetched
+        }
+    }
+
+    /// Drop the cache synchronously (tests only).
+    #[cfg(test)]
+    pub fn blocking_invalidate(&self, chain: &Chain, address: &str) {
+        self.used
+            .blocking_lock()
+            .remove(&(chain.id.to_string(), address.to_lowercase()));
+    }
+
+    /// Drop the cache so the next call refetches from the RPC (used when a
+    /// broadcast failed before the tx could have been mined).
+    pub async fn invalidate(&self, chain: &Chain, address: &str) {
+        self.used
+            .lock()
+            .await
+            .remove(&(chain.id.to_string(), address.to_lowercase()));
+    }
+}
+
 /// Swap client: 0x quotes + RPC broadcast.
 pub struct SwapClient {
     http: reqwest::Client,
@@ -119,6 +182,8 @@ pub struct SwapClient {
     rpc: RpcClient,
     /// (sponsor address, secret) for EIP-7702 gas sponsorship, when configured.
     pub sponsor: Option<(String, [u8; 32])>,
+    /// Serializes nonce assignment per (chain, signer) across concurrent calls.
+    nonce: NonceManager,
 }
 
 impl SwapClient {
@@ -131,6 +196,7 @@ impl SwapClient {
             api_key,
             rpc: RpcClient::new(),
             sponsor,
+            nonce: NonceManager::new(),
         }
     }
 
@@ -337,12 +403,37 @@ impl SwapClient {
             anyhow::bail!("RPC chain id mismatch: expected {}, got {}", chain.chain_id, actual);
         }
         let raw = sign_1559(tx, secret)?;
-        self.send_and_wait(chain, &raw).await
+        let signer = crate::crypto::derive_address(secret).unwrap_or_default();
+        self.send_and_wait_signed(chain, &signer, &raw).await
+    }
+
+    /// Send a raw signed transaction, waiting for its receipt; on a send
+    /// failure the nonce cache for the signer is dropped so the next call
+    /// refetches (the tx may not have been accepted).
+    pub async fn send_and_wait_signed(
+        &self,
+        chain: &Chain,
+        signer: &str,
+        raw: &str,
+    ) -> anyhow::Result<(String, bool)> {
+        match self.send_and_wait(chain, raw).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.nonce.invalidate(chain, signer).await;
+                Err(e)
+            }
+        }
     }
 
     /// Send a raw signed transaction and wait for its receipt.
     pub async fn send_and_wait(&self, chain: &Chain, raw: &str) -> anyhow::Result<(String, bool)> {
-        let hash = self.rpc.send_raw_transaction(chain, raw).await?;
+        let hash = match self.rpc.send_raw_transaction(chain, raw).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = %e, "broadcast failed");
+                return Err(e);
+            }
+        };
         let receipt = self
             .rpc
             .wait_for_receipt(chain, &hash, Duration::from_secs(90))
@@ -403,7 +494,7 @@ impl SwapClient {
             .unwrap_or(100_000)
             .max(60_000);
         let (priority, max_fee) = self.fees(chain, 0).await;
-        let nonce = self.rpc.nonce(chain, owner).await?;
+        let nonce = self.nonce.next(&self.rpc, chain, owner).await?;
         let tx = Tx1559 {
             chain_id: chain.chain_id,
             nonce,
@@ -462,14 +553,25 @@ impl SwapClient {
         };
 
         let (priority, max_fee) = self.fees(chain, quote.gas_price).await;
-        let nonce = self.rpc.nonce(chain, owner).await?;
+        let nonce = self.nonce.next(&self.rpc, chain, owner).await?;
         let data = hex::decode(quote.data.trim_start_matches("0x"))?;
+        // Prefer the quote gas; fall back to a live estimate (or a sane floor)
+        // when the API omitted it.
+        let data_hex = format!("0x{}", hex::encode(&data));
+        let gas = if quote.gas >= 21_000 {
+            quote.gas as u128
+        } else {
+            self.rpc
+                .estimate_gas(chain, owner, &quote.to, &format!("0x{:x}", quote.value), &data_hex)
+                .await
+                .unwrap_or(300_000)
+        };
         let tx = Tx1559 {
             chain_id: chain.chain_id,
             nonce,
             max_priority_fee: priority,
             max_fee,
-            gas: ((quote.gas as f64) * 1.2) as u64,
+            gas: ((gas as f64) * 1.2) as u64,
             to: quote.to.clone(),
             value: quote.value,
             data,
@@ -492,7 +594,7 @@ impl SwapClient {
         user_secret: &[u8; 32],
         delegate: &str,
     ) -> anyhow::Result<String> {
-        let nonce = self.rpc.nonce(chain, user_address).await?;
+        let nonce = self.nonce.next(&self.rpc, chain, user_address).await?;
         let (priority, max_fee) = self.fees(chain, 0).await;
         let gas = self
             .rpc
@@ -516,7 +618,7 @@ impl SwapClient {
             }),
         };
         let raw = crate::eip7702::sign_7702(&tx, user_secret)?;
-        let (hash, ok) = self.send_and_wait(chain, &raw).await?;
+        let (hash, ok) = self.send_and_wait_signed(chain, user_address, &raw).await?;
         if !ok {
             anyhow::bail!("delegation reverted: {hash}");
         }
@@ -530,7 +632,7 @@ impl SwapClient {
         user_address: &str,
         user_secret: &[u8; 32],
     ) -> anyhow::Result<String> {
-        let nonce = self.rpc.nonce(chain, user_address).await?;
+        let nonce = self.nonce.next(&self.rpc, chain, user_address).await?;
         let (priority, max_fee) = self.fees(chain, 0).await;
         let tx = crate::eip7702::Tx7702 {
             chain_id: chain.chain_id,
@@ -548,7 +650,7 @@ impl SwapClient {
             }),
         };
         let raw = crate::eip7702::sign_7702(&tx, user_secret)?;
-        let (hash, ok) = self.send_and_wait(chain, &raw).await?;
+        let (hash, ok) = self.send_and_wait_signed(chain, user_address, &raw).await?;
         if !ok {
             anyhow::bail!("delegation clear reverted: {hash}");
         }
@@ -562,7 +664,7 @@ impl SwapClient {
         sponsor_address: &str,
         sponsor_secret: &[u8; 32],
     ) -> anyhow::Result<(String, String)> {
-        let nonce = self.rpc.nonce(chain, sponsor_address).await?;
+        let nonce = self.nonce.next(&self.rpc, chain, sponsor_address).await?;
         // address = keccak(rlp([sender, nonce]))[12:]
         let mut stream = rlp::RlpStream::new_list(2);
         stream.append(&crate::swap::decode_address(sponsor_address)?);
@@ -589,7 +691,7 @@ impl SwapClient {
             data,
         };
         let raw = sign_1559(&tx, sponsor_secret)?;
-        let (hash, ok) = self.send_and_wait(chain, &raw).await?;
+        let (hash, ok) = self.send_and_wait_signed(chain, sponsor_address, &raw).await?;
         if !ok {
             anyhow::bail!("sponsor account deploy reverted: {hash}");
         }
@@ -619,7 +721,7 @@ impl SwapClient {
             .unwrap_or(gas_floor as u128)
             .max(gas_floor as u128);
         let (priority, max_fee) = self.fees(chain, 0).await;
-        let nonce = self.rpc.nonce(chain, sponsor_address).await?;
+        let nonce = self.nonce.next(&self.rpc, chain, sponsor_address).await?;
         let tx = Tx1559 {
             chain_id: chain.chain_id,
             nonce,
@@ -631,7 +733,7 @@ impl SwapClient {
             data: call,
         };
         let raw = sign_1559(&tx, sponsor_secret)?;
-        self.send_and_wait(chain, &raw).await
+        self.send_and_wait_signed(chain, sponsor_address, &raw).await
     }
     /// Live buy: spend `amount_native_wei` of the chain's native coin for a token.
     pub async fn buy_native(
@@ -787,4 +889,33 @@ pub fn decode_address(addr: &str) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("address {addr} must be 20 bytes");
     }
     Ok(bytes)
+}
+
+
+#[cfg(test)]
+mod nonce_tests {
+    use super::*;
+    use crate::chains;
+
+    #[test]
+    fn nonce_manager_increments_without_rpc() {
+        let mgr = NonceManager::new();
+        let eth = chains::by_id("ethereum").unwrap();
+        let signer = "0xabc";
+        assert_eq!(mgr.next_with(eth, signer, 7), 7);
+        assert_eq!(mgr.next_with(eth, signer, 999), 8);
+        assert_eq!(mgr.next_with(eth, signer, 999), 9);
+        assert_eq!(mgr.next_with(eth, "0xdef", 3), 3);
+        let bsc = chains::by_id("bsc").unwrap();
+        assert_eq!(mgr.next_with(bsc, signer, 1), 1);
+    }
+
+    #[test]
+    fn nonce_manager_invalidate_refetches() {
+        let mgr = NonceManager::new();
+        let eth = chains::by_id("ethereum").unwrap();
+        assert_eq!(mgr.next_with(eth, "0xabc", 5), 5);
+        mgr.blocking_invalidate(eth, "0xabc");
+        assert_eq!(mgr.next_with(eth, "0xabc", 5), 5);
+    }
 }

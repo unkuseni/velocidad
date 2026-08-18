@@ -32,6 +32,8 @@ pub struct TradeReceipt {
     pub tx_ref: String,
     /// Explorer link for live swaps.
     pub explorer_link: Option<String>,
+    /// `"dexscreener"` (live data) or `"simulator"` (no live quote found).
+    pub price_source: &'static str,
 }
 
 pub struct TradingEngine {
@@ -68,6 +70,9 @@ impl TradingEngine {
         if price <= 0.0 {
             bail!("no valid price for this token on {}", chain.id);
         }
+        if quote.source == "simulator" {
+            tracing::warn!(token = %token_address, chain = %chain.id, "no live price — simulated fill");
+        }
         let quantity = amount_native / price;
 
         let conn = db.conn();
@@ -94,7 +99,7 @@ impl TradingEngine {
         let alerts_fired = repo::trigger_satisfied_alerts(&tx, user_id, token_address, price).await?;
         tx.commit().await?;
 
-        self.receipt(&conn, order_id, token_address, Some(0.0))
+        self.receipt(&conn, order_id, token_address, Some(0.0), quote.source)
             .await
             .map(|mut r| {
                 r.alerts_fired = alerts_fired;
@@ -123,11 +128,14 @@ impl TradingEngine {
         if price <= 0.0 {
             bail!("no valid price for this token on {}", chain.id);
         }
+        if quote.source == "simulator" {
+            tracing::warn!(token = %token_address, chain = %chain.id, "no live price — simulated fill");
+        }
         let proceeds = quantity * price;
 
         let conn = db.conn();
         let tx = conn.transaction().await?;
-        let realized = repo::reduce_position(&tx, user_id, token_address, quantity, price).await?;
+        let realized = repo::reduce_position(&tx, user_id, chain.id, token_address, quantity, price).await?;
         let order_id = repo::insert_order(
             &tx,
             &repo::NewOrder {
@@ -149,7 +157,7 @@ impl TradingEngine {
         let alerts_fired = repo::trigger_satisfied_alerts(&tx, user_id, token_address, price).await?;
         tx.commit().await?;
 
-        let mut receipt = self.receipt(&conn, order_id, token_address, Some(realized)).await?;
+        let mut receipt = self.receipt(&conn, order_id, token_address, Some(realized), quote.source).await?;
         receipt.alerts_fired = alerts_fired;
         Ok(receipt)
     }
@@ -208,6 +216,9 @@ impl TradingEngine {
         if price <= 0.0 {
             bail!("no valid price for this token on {}", chain.id);
         }
+        if quote.source == "simulator" {
+            bail!("no live price for this token — refusing to fill at a simulated price");
+        }
         let amount = order.amount_in.unwrap_or(0.0);
         if amount <= 0.0 {
             bail!("limit order has no amount_in");
@@ -230,7 +241,7 @@ impl TradingEngine {
         let alerts_fired = repo::trigger_satisfied_alerts(&tx, order.user_id, &order.token_address, price).await?;
         tx.commit().await?;
 
-        self.receipt(&conn, order.id, &order.token_address, Some(0.0))
+        self.receipt(&conn, order.id, &order.token_address, Some(0.0), quote.source)
             .await
             .map(|mut r| {
                 r.alerts_fired = alerts_fired;
@@ -245,13 +256,14 @@ impl TradingEngine {
         order_id: i64,
         token_address: &str,
         realized_pnl: Option<f64>,
+        price_source: &'static str,
     ) -> Result<TradeReceipt> {
         let order = repo::get_order(conn, order_id).await?.context("order not found")?;
-        let symbol = repo::get_token(conn, token_address)
+        let symbol = repo::get_token(conn, &order.network, token_address)
             .await?
             .and_then(|t| t.symbol)
             .or_else(|| Some(short_address(token_address)));
-        let pos = repo::get_position(conn, order.user_id, token_address).await?;
+        let pos = repo::get_position(conn, order.user_id, &order.network, token_address).await?;
         Ok(TradeReceipt {
             order,
             token_symbol: symbol,
@@ -261,6 +273,7 @@ impl TradingEngine {
             alerts_fired: 0,
             tx_ref: "paper".to_string(),
             explorer_link: None,
+            price_source,
         })
     }
 }

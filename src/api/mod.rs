@@ -14,8 +14,11 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::header::AUTHORIZATION;
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -26,8 +29,14 @@ use crate::chains;
 use crate::db::repo;
 
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    let api_key = state.config.api_key.clone();
+    if api_key.as_ref().map(|k| k.trim().is_empty()).unwrap_or(true) {
+        tracing::warn!(
+            "API_KEY is not set — the HTTP API is running OPEN. Set API_KEY to require \
+             Authorization: Bearer <key> on /api/v1/* endpoints."
+        );
+    }
+    let api = Router::new()
         .route("/api/v1/chains", get(chain_list))
         .route("/api/v1/users/:telegram_id", get(user_info))
         .route("/api/v1/portfolio/:telegram_id", get(portfolio))
@@ -40,7 +49,44 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/boosts", get(token_boosts))
         .route("/api/v1/alerts/:telegram_id", get(alerts))
         .route("/api/v1/alerts", post(create_alert))
-        .with_state(state)
+        // Everything under /api/v1 requires the bearer token when configured.
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key))
+        .with_state(state);
+
+    // /health stays open for load balancers/probes.
+    Router::new()
+        .route("/health", get(health))
+        .merge(api)
+}
+
+/// Rejects requests without a matching `Authorization: Bearer <API_KEY>` when
+/// `API_KEY` is configured. Open (dev) mode when unset.
+async fn require_api_key(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = state.config.api_key.as_ref() else {
+        return next.run(req).await;
+    };
+    if expected.trim().is_empty() {
+        return next.run(req).await;
+    }
+    let supplied = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|k| k.trim());
+    if supplied == Some(expected.as_str()) {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [("WWW-Authenticate", "Bearer realm=\"velocidad\"")],
+        Json(json!({ "error": "unauthorized — set Authorization: Bearer <API_KEY>" })),
+    )
+        .into_response()
 }
 
 /// Run the HTTP server until cancelled.
@@ -418,7 +464,7 @@ async fn token_info(
     };
     let quote = state.market.quote(chain, &address).await;
     let report = state.scanner.scan(&state.db, chain, &address).await;
-    let cached = repo::get_token(state.db.conn(), &address).await.unwrap_or(None);
+    let cached = repo::get_token(state.db.conn(), chain.id, &address).await.unwrap_or(None);
     ok(json!({
         "address": address,
         "chain": chain.id,

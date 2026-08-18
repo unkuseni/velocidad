@@ -735,7 +735,6 @@ fn approve_instruction(program_idx: u8, source_idx: u8, delegate_idx: u8, owner_
 }
 
 /// SPL-token Revoke instruction blob (variant 5).
-#[allow(dead_code)]
 fn revoke_instruction(program_idx: u8, source_idx: u8, owner_idx: u8) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(program_idx);
@@ -774,7 +773,6 @@ pub fn build_sponsored_approve(
 }
 
 /// Assemble an SPL Revoke transaction with the sponsor as fee payer.
-#[allow(dead_code)]
 pub fn build_sponsored_revoke(
     owner: &[u8; 32],
     source_token_account: &[u8; 32],
