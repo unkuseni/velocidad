@@ -61,7 +61,7 @@ impl TradingEngine {
         slippage: f64,
         side: &str,
     ) -> Result<TradeReceipt> {
-        self.risk.validate_trade(token_address, amount_native, slippage, chain.native)?;
+        self.risk.validate_trade(chain, token_address, amount_native, slippage)?;
 
         let quote = self.market.quote(chain, token_address).await;
         let price = quote.price_native;
@@ -113,7 +113,7 @@ impl TradingEngine {
         quantity: f64,
         slippage: f64,
     ) -> Result<TradeReceipt> {
-        self.risk.validate_trade(token_address, quantity, slippage, chain.native)?;
+        self.risk.validate_trade(chain, token_address, quantity, slippage)?;
         if quantity <= 0.0 {
             bail!("quantity must be positive");
         }

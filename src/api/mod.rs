@@ -35,6 +35,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/trades/:telegram_id", get(trade_history))
         .route("/api/v1/trades", post(create_trade))
         .route("/api/v1/tokens/:address", get(token_info))
+        .route("/api/v1/search", get(token_search))
+        .route("/api/v1/boosts", get(token_boosts))
         .route("/api/v1/alerts/:telegram_id", get(alerts))
         .route("/api/v1/alerts", post(create_alert))
         .with_state(state)
@@ -122,12 +124,18 @@ async fn portfolio(
                 Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, &e),
             };
             let mut items = Vec::new();
+            let mut totals: std::collections::BTreeMap<String, f64> = Default::default();
+            let mut total_usd = 0.0;
             for p in &positions {
                 let chain = chains::by_id(&p.network).unwrap_or_else(|| chains::by_id("ethereum").unwrap());
                 let quote = state.market.quote(chain, &p.token_address).await;
                 let price = quote.price_native;
                 let value = p.quantity * price;
                 let unrealized = (price - p.avg_price) * p.quantity;
+                let native_usd = state.market.native_price_usd(chain).await;
+                let value_usd = value * native_usd;
+                total_usd += value_usd;
+                *totals.entry(p.network.clone()).or_default() += value_usd;
                 items.push(json!({
                     "token_address": p.token_address,
                     "network": p.network,
@@ -136,12 +144,17 @@ async fn portfolio(
                     "current_price": price,
                     "price_usd": quote.price_usd,
                     "value_native": value,
-                    "value_usd": value * state.market.native_price_usd(chain).await,
+                    "value_usd": value_usd,
                     "unrealized_pnl": unrealized,
                     "realized_pnl": p.realized_pnl,
                 }));
             }
-            ok(json!({ "telegram_id": telegram_id, "positions": items }))
+            ok(json!({
+                "telegram_id": telegram_id,
+                "positions": items,
+                "totals_usd": totals,
+                "total_value_usd": total_usd,
+            }))
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -162,28 +175,51 @@ async fn balances(
                 Some(c) => c,
                 None => chains::by_id(&state.config.default_chain).unwrap_or_else(|| chains::by_id("ethereum").unwrap()),
             };
-            let wallet = match repo::get_default_wallet(state.db.conn(), user.id).await {
+            let wallet = match repo::get_default_wallet_for(state.db.conn(), user.id, chain.id).await {
                 Ok(Some(w)) => w,
-                Ok(None) => return ok(json!({ "telegram_id": telegram_id, "chain": chain.id, "balances": [] })),
+                Ok(None) => match repo::get_default_wallet(state.db.conn(), user.id).await {
+                    Ok(Some(w)) => w,
+                    _ => return ok(json!({ "telegram_id": telegram_id, "chain": chain.id, "balances": [] })),
+                },
                 Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, &e),
             };
             let native_usd = state.market.native_price_usd(chain).await;
-            let native = state.rpc.native_balance(chain, &wallet.address).await.unwrap_or(0);
-            let mut tokens = Vec::new();
-            for (symbol, addr) in chain.default_erc20s {
-                if let Ok(raw) = state.rpc.erc20_balance(chain, addr, &wallet.address).await {
-                    let decimals = state.rpc.erc20_decimals(chain, addr).await;
-                    let bal = raw as f64 / 10f64.powi(decimals as i32);
-                    if bal > 0.0 {
-                        tokens.push(json!({ "symbol": symbol, "address": addr, "balance": bal }));
+            let mut tokens: Vec<serde_json::Value> = Vec::new();
+            let (native_balance, native_divisor) = match chain.kind {
+                chains::ChainKind::Evm => (state.rpc.native_balance(chain, &wallet.address).await.unwrap_or(0), 1e18),
+                chains::ChainKind::Solana => (state.solana.balance(chain, &wallet.address).await.unwrap_or(0) as u128, 1e9),
+            };
+            if chain.kind == chains::ChainKind::Solana {
+                if let Ok(balances) = state.solana.spl_balances(chain, &wallet.address).await {
+                    let mut items: Vec<(String, f64, f64)> = Vec::new();
+                    for b in balances.iter().take(8) {
+                        let q = state.market.quote(chain, &b.mint).await;
+                        if q.price_usd > 0.0 {
+                            items.push((q.symbol, b.amount, q.price_usd * b.amount));
+                        }
+                    }
+                    items.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                    for (symbol, amount, usd) in items.iter().take(6) {
+                        tokens.push(json!({ "symbol": symbol, "balance": amount, "usd_value": usd }));
+                    }
+                }
+            } else {
+                for (symbol, addr) in chain.default_erc20s {
+                    if let Ok(raw) = state.rpc.erc20_balance(chain, addr, &wallet.address).await {
+                        let decimals = state.rpc.erc20_decimals(chain, addr).await;
+                        let bal = raw as f64 / 10f64.powi(decimals as i32);
+                        if bal > 0.0 {
+                            tokens.push(json!({ "symbol": symbol, "address": addr, "balance": bal }));
+                        }
                     }
                 }
             }
             ok(json!({
                 "telegram_id": telegram_id,
                 "chain": chain.id,
+                "kind": match chain.kind { chains::ChainKind::Evm => "evm", chains::ChainKind::Solana => "solana" },
                 "wallet": wallet.address,
-                "native": { "symbol": chain.native, "balance": native as f64 / 1e18, "usd_value": native as f64 / 1e18 * native_usd },
+                "native": { "symbol": chain.native, "balance": native_balance as f64 / native_divisor, "usd_value": native_balance as f64 / native_divisor * native_usd },
                 "tokens": tokens,
             }))
         }
@@ -296,6 +332,22 @@ async fn create_trade(
 #[derive(Debug, Deserialize)]
 struct TokenQuery {
     chain: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: String,
+}
+
+async fn token_search(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SearchQuery>,
+) -> ApiResult {
+    ok(json!({ "query": params.q, "results": state.market.search(&params.q).await }))
+}
+
+async fn token_boosts(State(state): State<Arc<AppState>>) -> ApiResult {
+    ok(json!({ "boosts": state.market.boosts().await }))
 }
 
 async fn token_info(

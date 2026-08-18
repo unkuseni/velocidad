@@ -3,6 +3,8 @@
 
 use anyhow::{bail, Result};
 
+use crate::chains::{Chain, ChainKind};
+
 #[derive(Debug, Clone)]
 pub struct RiskManager {
     /// Maximum order size in ETH (paper account).
@@ -21,19 +23,33 @@ impl Default for RiskManager {
 }
 
 impl RiskManager {
-    pub fn validate_trade(&self, token_address: &str, amount: f64, slippage: f64, native: &str) -> Result<()> {
+    pub fn validate_trade(&self, chain: &Chain, token_address: &str, amount: f64, slippage: f64) -> Result<()> {
         if amount <= 0.0 {
             bail!("amount must be positive");
         }
         if amount > self.max_order_eth {
-            bail!("order exceeds max size of {} {}", self.max_order_eth, native);
+            bail!("order exceeds max size of {} {}", self.max_order_eth, chain.native);
         }
         if slippage < 0.0 || slippage > self.max_slippage {
             bail!("slippage must be between 0 and {}%", self.max_slippage * 100.0);
         }
-        let t = token_address.trim().trim_start_matches("0x");
-        if t.len() < 32 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
-            bail!("invalid token address: expected a hex address like 0x…");
+        match chain.kind {
+            ChainKind::Evm => {
+                let t = token_address.trim().trim_start_matches("0x");
+                if t.len() != 40 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+                    bail!("invalid token address: expected a 0x… hex address (40 hex chars)");
+                }
+            }
+            ChainKind::Solana => {
+                let t = token_address.trim();
+                let ok = match bs58::decode(t).into_vec() {
+                    Ok(b) => b.len() == 32,
+                    Err(_) => false,
+                };
+                if !ok {
+                    bail!("invalid token address: expected a base58 Solana mint (32 bytes)");
+                }
+            }
         }
         Ok(())
     }

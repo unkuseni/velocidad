@@ -2,9 +2,10 @@
 
 A **Trojan/Photon/Axiom-style Telegram trading bot** built in Rust — token sniping,
 instant buy/sell, auto-filled limit orders, security scans, price alerts, wallets,
-portfolio tracking — with **multi-chain EVM support** (Ethereum, BSC, Polygon,
-Arbitrum, Optimism, Base, Avalanche, Fantom, Linea, Blast, Scroll, Gnosis) and
-**libSQL / Turso** as the database.
+portfolio tracking — with **multi-chain support**: 12 EVM chains (Ethereum, BSC,
+Polygon, Arbitrum, Optimism, Base, Avalanche, Fantom, Linea, Blast, Scroll, Gnosis)
+**plus Solana** (ed25519 wallets, SPL tokens, Jupiter swaps) and **libSQL / Turso**
+as the database.
 
 ```
 Telegram Bot (teloxide) ─┐
@@ -19,17 +20,17 @@ background workers: limit-order matching + price-alert polling
 
 | Feature | How |
 | --- | --- |
-| ⛓️ Multi-chain EVM | 12 chains via one registry; `chain:0x…` prefix on any token command or a per-user default chain |
-| 💰 Wallet management | Generate/import EVM wallets; private keys encrypted at rest with AES-256-GCM (`k256` + `sha3` + `aes-gcm`) |
+| ⛓️ Multi-chain | 13 chains via one registry (12 EVM + Solana); `chain:0x…` / `sol:…` prefix on any token command or a per-user default chain |
+| 💰 Wallet management | Generate/import EVM + Solana wallets (auto-detected); private keys encrypted at rest with AES-256-GCM |
 | 📈 Live market data | DexScreener prices, liquidity, volume, FDV, pair age, buy/sell pressure — with an offline simulator fallback |
-| 🟢🔴 Instant buy/sell | Paper fills at **live** prices by default; real on-chain swaps via 0x Swap API v2 (EIP-1559, signed locally) when `PAPER_TRADING=false` |
+| 🟢🔴 Instant buy/sell | Paper fills at **live** prices by default; real on-chain swaps when `PAPER_TRADING=false` — EVM via 0x Swap API v2 (EIP-1559), Solana via Jupiter v6 (ed25519, keyless) |
 | 🛰️ Token sniping | Same fast path, with an automated honeypot/risk gate |
-| 🔬 Security scans | Liquidity, pair age, price action, buy/sell pressure + optional honeypot.is live simulation → risk score, cached in DB |
+| 🔬 Security scans | Liquidity, pair age, price action, buy/sell pressure + optional honeypot.is live simulation (EVM) → risk score |
 | ⏳ Limit orders | Pending orders **auto-filled by a background worker** when the trigger price is hit, with Telegram notification |
 | 🔔 Price alerts | `above`/`below` triggers checked by a background poller; instant Telegram notification |
-| 📂 Portfolio & PnL | Weighted-average positions, realized + unrealized PnL, per-chain |
-| 💰 On-chain balances | Native + curated stablecoin balances via public RPCs (`/balance`) |
-| 🧾 Order history | Full trade log per user, chain-tagged |
+| 📂 Portfolio & PnL | Weighted-average positions, realized + unrealized PnL, per-chain with USD totals |
+| 💰 On-chain balances | Native + token balances via public RPCs (EVM ERC-20, Solana SPL) (`/balance`) |
+| 🔍 Token discovery | `/find <ticker>` (full-text search), `/trending`, `/boosts` (DexScreener feeds) |
 | 🌐 Web API | Axum REST API mirroring the bot (see below) |
 | 🗄️ Storage | **libSQL** — local SQLite file or remote **Turso** (same code path) |
 
@@ -62,9 +63,12 @@ safe.** Then open your bot in Telegram:
 
 ```
 /start                       👋 onboard
-/wallet new                  💰 create a wallet (private key shown once)
+/wallet new                  💰 create an EVM wallet (private key shown once)
+/wallet new solana           🪐 create a Solana wallet (Phantom-style key)
+/wallet import <key>         📥 auto-detects EVM hex / Solana base58
 /chain bsc                   ⛓️ set your default chain
 /buy bsc:0xdeadbeef… 0.5     🟢 buy 0.5 BNB worth of a BSC token
+/buy sol:EPjF… 1.5           🪐 buy Solana tokens (paper or live via Jupiter)
 /sell 0xdeadbeef… all        🔴 sell your whole position
 /snipe 0xdeadbeef… 0.5       🛰️ snipe with honeypot gate
 /limit 0xdeadbeef… 0.0001 0.5 ⏳ auto-filled limit order
@@ -72,15 +76,18 @@ safe.** Then open your bot in Telegram:
 /token 0xdeadbeef…           🔎 full market info (liquidity, volume, FDV, age)
 /scan 0xdeadbeef…            🔬 security report
 /alert 0xdeadbeef… above 0.001 🔔 price alert (auto-notified)
+/find pepe                   🔍 search tokens by ticker across chains
 /trending                    🔥 trending tokens
-/balance                     💰 on-chain balances (native + stablecoins)
-/portfolio                   📂 positions + PnL
+/boosts                      🚀 top boosted tokens
+/balance                     💰 on-chain balances (EVM + Solana)
+/portfolio                   📂 positions + PnL with per-chain USD totals
 /settings slippage 0.10      ⚙️ slippage
 /help                        ❓ all commands
 ```
 
 **Multi-chain:** prefix any token with `chain:` — `/buy bsc:0x…`, `/price arb:0x…`,
-`/scan base:0x…`. Without a prefix the user's default chain (`/chain`) is used.
+`/scan sol:EPjF…`. Without a prefix the user's default chain (`/chain`) is used.
+Solana addresses are base58 mints; `sol:` also works as the prefix.
 
 ## Live trading (on-chain swaps)
 
@@ -175,7 +182,7 @@ src/
 | `API_PORT` | `8080` | HTTP API port |
 | `PAPER_TRADING` | `true` | simulate fills (at live prices) instead of broadcasting |
 | `LIVE_MARKET` | `true` | DexScreener live prices (offline fallback to simulator) |
-| `DEFAULT_CHAIN` | `ethereum` | default chain for chain-less commands |
+| `DEFAULT_CHAIN` | `ethereum` | default chain for chain-less commands (`solana` works too) |
 | `ZEROEX_API_KEY` | — | 0x Swap API v2 key → enables real on-chain swaps |
 | `HONEYPOT_API_KEY` | — | honeypot.is key → live honeypot simulations in /scan |
 | `MASTER_KEY` | auto-generated | 64-hex AES key for wallet encryption |

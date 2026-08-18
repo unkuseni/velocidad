@@ -13,6 +13,7 @@ mod db;
 mod market;
 mod rpc;
 mod security;
+mod solana;
 mod swap;
 mod trading;
 mod workers;

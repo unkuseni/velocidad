@@ -8,6 +8,7 @@ use crate::db::Db;
 use crate::market::MarketData;
 use crate::rpc::RpcClient;
 use crate::security::TokenScanner;
+use crate::solana::SolanaClient;
 use crate::swap::SwapClient;
 use crate::trading::TradingEngine;
 
@@ -18,6 +19,7 @@ pub struct AppState {
     pub scanner: TokenScanner,
     pub rpc: RpcClient,
     pub swap: SwapClient,
+    pub solana: SolanaClient,
     pub keyring: Arc<Keyring>,
     pub config: Config,
 }
@@ -32,6 +34,7 @@ impl AppState {
             scanner: TokenScanner::new(market, config.honeypot_api_key.clone()),
             rpc: RpcClient::new(),
             swap: SwapClient::new(config.zeroex_api_key.clone()),
+            solana: SolanaClient::new(),
             keyring: Arc::new(keyring),
             config,
         }

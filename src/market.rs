@@ -58,7 +58,7 @@ pub struct TrendingToken {
     pub url: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct DexPairsResponse {
     #[serde(default)]
     pairs: Vec<DexPair>,
@@ -75,6 +75,8 @@ struct DexPair {
     pair_address: Option<String>,
     #[serde(default)]
     base_token: Option<DexToken>,
+    #[serde(default)]
+    quote_token: Option<DexToken>,
     #[serde(default)]
     price_usd: Option<String>,
     #[serde(default)]
@@ -201,25 +203,67 @@ impl MarketData {
             return None;
         }
 
-        // Best pair for this chain = highest liquidity, but only pairs where
-        // the requested token is the BASE token — when a token appears as the
-        // quote side (e.g. ARK/USDT) the prices describe the other token!
+        // Best pair for this chain = highest liquidity among pairs where the
+        // requested token is the BASE token (when a token appears as the quote
+        // side, prices describe the other token). Additionally prefer pairs
+        // quoted in the chain native or a stablecoin — bogus pairings like a
+        // broken JUP/MET pool can otherwise dominate by liquidity.
         let token_lower = token.to_lowercase();
+        let base_matches = |p: &&DexPair| {
+            p.chain_id.as_deref() == Some(chain.dex_segment)
+                && p.base_token
+                    .as_ref()
+                    .and_then(|t| t.address.as_deref())
+                    .map(|a| a.to_lowercase() == token_lower)
+                    .unwrap_or(false)
+        };
+        let safe_quote = |p: &&DexPair| {
+            let sym = p
+                .quote_token
+                .as_ref()
+                .and_then(|t| t.symbol.as_deref())
+                .map(|s| s.to_uppercase());
+            let addr = p
+                .quote_token
+                .as_ref()
+                .and_then(|t| t.address.as_deref())
+                .map(|a| a.to_lowercase());
+            let native = chain.native.to_uppercase();
+            let wrapped = format!("W{}", chain.native).to_uppercase();
+            let stable = match sym.as_deref() {
+                Some(s) => {
+                    let s = s.to_uppercase();
+                    s == native
+                        || s == wrapped
+                        || matches!(
+                            s.as_str(),
+                            "USDC" | "USDT" | "DAI" | "BUSD" | "FDUSD" | "USDS" | "PYUSD" | "USDY" | "TUSD"
+                        )
+                }
+                None => false,
+            };
+            stable || addr.as_deref() == Some(&chain.wrapped_native.to_lowercase())
+        };
         let best = resp
             .pairs
             .iter()
-            .filter(|p| {
-                p.chain_id.as_deref() == Some(chain.dex_segment)
-                    && p.base_token
-                        .as_ref()
-                        .and_then(|t| t.address.as_deref())
-                        .map(|a| a.to_lowercase() == token_lower)
-                        .unwrap_or(false)
-            })
+            .filter(base_matches)
+            .filter(safe_quote)
             .max_by(|a, b| {
                 a.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0)
                     .partial_cmp(&b.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0))
                     .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .or_else(|| {
+                // Fall back to any base-matching pair when no safe-quote pair exists.
+                resp.pairs
+                    .iter()
+                    .filter(base_matches)
+                    .max_by(|a, b| {
+                        a.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0)
+                            .partial_cmp(&b.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
             })?;
 
         let native_usd = self.native_price_usd(chain).await;
@@ -351,6 +395,7 @@ impl MarketData {
 
     async fn fetch_trending(&self) -> Vec<TrendingToken> {
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct Profile {
             #[serde(default)]
             chain_id: Option<String>,
@@ -446,6 +491,123 @@ pub fn short_addr(addr: &str) -> String {
         format!("{}…{}", &a[..6], &a[a.len() - 4..])
     } else {
         a.to_string()
+    }
+}
+
+
+/// A token search hit (DexScreener /search).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchResult {
+    pub chain: String,
+    pub address: String,
+    pub name: String,
+    pub symbol: String,
+    pub price_usd: f64,
+    pub liquidity_usd: f64,
+    pub volume_24h_usd: f64,
+    pub price_change_24h: f64,
+}
+
+/// A boosted token (DexScreener /token-boosts).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BoostedToken {
+    pub chain: String,
+    pub address: String,
+    pub amount: f64,
+    pub total_amount: f64,
+}
+
+impl MarketData {
+    /// Full-text token search across chains (DexScreener /search).
+    /// Results are deduplicated per (chain, token) keeping the most liquid pair.
+    pub async fn search(&self, q: &str) -> Vec<SearchResult> {
+        if !self.live || q.trim().is_empty() {
+            return Vec::new();
+        }
+        // Minimal URL encoding: spaces → %20, drop other unsafe chars.
+        let qq: String = q
+            .trim()
+            .chars()
+            .map(|c| if c == ' ' { "%20".to_string() } else if c.is_ascii_alphanumeric() { c.to_string() } else { String::new() })
+            .collect();
+        if qq.is_empty() {
+            return Vec::new();
+        }
+        let url = format!("https://api.dexscreener.com/latest/dex/search?q={qq}");
+        let resp: DexPairsResponse = match self.http.get(&url).send().await {
+            Ok(r) => r.json().await.unwrap_or_default(),
+            Err(_) => return Vec::new(),
+        };
+
+        let mut seen: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+        let mut out: Vec<SearchResult> = Vec::new();
+        for p in resp.pairs {
+            let Some(base) = &p.base_token else { continue };
+            let Some(address) = base.address.clone() else { continue };
+            let chain = p.chain_id.clone().unwrap_or_default();
+            if chain.is_empty() {
+                continue;
+            }
+            let price = p.price_usd.as_ref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            let liq = p.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0);
+            let key = (chain.clone(), address.to_lowercase());
+            let hit = SearchResult {
+                chain,
+                address,
+                name: base.name.clone().unwrap_or_default(),
+                symbol: base.symbol.clone().unwrap_or_default(),
+                price_usd: price,
+                liquidity_usd: liq,
+                volume_24h_usd: p.volume.as_ref().and_then(|v| v.h24).unwrap_or(0.0),
+                price_change_24h: p.price_change.as_ref().and_then(|c| c.h24).unwrap_or(0.0),
+            };
+            match seen.get(&key) {
+                Some(idx) if out[*idx].liquidity_usd < liq => out[*idx] = hit,
+                Some(_) => {},
+                None => {
+                    seen.insert(key, out.len());
+                    out.push(hit);
+                }
+            }
+        }
+        out.sort_by(|a, b| b.liquidity_usd.partial_cmp(&a.liquidity_usd).unwrap_or(std::cmp::Ordering::Equal));
+        out.truncate(15);
+        out
+    }
+
+    /// Top boosted tokens (DexScreener /token-boosts/top/v1).
+    pub async fn boosts(&self) -> Vec<BoostedToken> {
+        if !self.live {
+            return Vec::new();
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Boost {
+            #[serde(default)]
+            chain_id: Option<String>,
+            #[serde(default)]
+            token_address: Option<String>,
+            #[serde(default)]
+            amount: Option<f64>,
+            #[serde(default)]
+            total_amount: Option<f64>,
+        }
+        let url = "https://api.dexscreener.com/token-boosts/top/v1";
+        let boosts: Vec<Boost> = match self.http.get(url).send().await {
+            Ok(r) => r.json().await.unwrap_or_default(),
+            Err(_) => return Vec::new(),
+        };
+        boosts
+            .into_iter()
+            .filter_map(|b| {
+                Some(BoostedToken {
+                    chain: b.chain_id?,
+                    address: b.token_address?,
+                    amount: b.amount.unwrap_or(0.0),
+                    total_amount: b.total_amount.unwrap_or(0.0),
+                })
+            })
+            .collect()
     }
 }
 

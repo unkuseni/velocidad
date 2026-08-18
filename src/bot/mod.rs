@@ -60,6 +60,10 @@ pub enum Command {
     Chains,
     #[command(description = "trending tokens")]
     Trending,
+    #[command(description = "search tokens by name/symbol: /find pepe")]
+    Find(String),
+    #[command(description = "top boosted tokens")]
+    Boosts,
     #[command(description = "trading settings: /settings, /settings slippage 0.05")]
     Settings,
 }
@@ -127,6 +131,8 @@ async fn dispatch_command(
         }
         Command::Chains => cmd_chains(&state, &msg).await,
         Command::Trending => cmd_trending(&state, &msg).await,
+        Command::Find(q) => cmd_find(&state, &msg, &q).await,
+        Command::Boosts => cmd_boosts(&state, &msg).await,
         Command::Settings => {
             let arg = rest_of_command(&msg, "/settings");
             cmd_settings(&state, &msg, arg).await
@@ -205,42 +211,62 @@ async fn cmd_wallet(state: &AppState, msg: &Message, arg: Option<String>) -> Res
             let mut s = String::from("👛 <b>Wallets</b>\n");
             for w in &wallets {
                 let badge = if w.is_default { "⭐ " } else { "   " };
+                let icon = if w.network == "solana" { "🪐" } else { "⛓️" };
                 s.push_str(&format!(
-                    "{}{} <code>{}</code>\n",
-                    badge, w.label, w.address
+                    "{icon} {}{} <code>{}</code> · {}\n",
+                    badge, w.label, w.address, w.network
                 ));
             }
-            s.push_str("\nEVM wallets work on every chain — pick one with /chain.");
+            s.push_str("\nEVM wallets work on every EVM chain; Solana needs its own (/wallet new solana).");
             Ok(s)
         }
-        Some("new") => {
-            let gw = crypto::generate_wallet()?;
-            let enc = state.keyring.encrypt(gw.private_key_hex.as_bytes())?;
-            repo::insert_wallet(state.db.conn(), user_id, &gw.address, "Main", Some(&enc), true)
-                .await?;
-            Ok(format!(
-                "✅ <b>Wallet created</b>\n\n\
-                 📮 Address: <code>{}</code>\n\
-                 🔑 Private key (shown once): <code>{}</code>\n\n\
-                 ⚠️ Store it safely — it is encrypted at rest with your master key.",
-                gw.address, gw.private_key_hex
-            ))
+        Some(rest) if rest.starts_with("new") => {
+            let sub = rest.trim_start_matches("new").trim();
+            if sub == "solana" || sub == "sol" {
+                let sw = crypto::generate_solana_wallet()?;
+                let enc = state.keyring.encrypt(hex::decode(&sw.seed_hex)?.as_slice())?;
+                repo::insert_wallet(state.db.conn(), user_id, &sw.address, "Main", Some(&enc), true)
+                    .await?;
+                Ok(format!(
+                    "🪐 <b>Solana wallet created</b>\n\n\",
+                     📮 Address: <code>{}</code>\n\",
+                     🔑 Private key (shown once): <code>{}</code>\n\n\",
+                     ⚠️ Store it safely — it is encrypted at rest with your master key.",
+                    sw.address, sw.private_key_base58
+                ))
+            } else {
+                let gw = crypto::generate_wallet()?;
+                let enc = state.keyring.encrypt(gw.private_key_hex.as_bytes())?;
+                repo::insert_wallet(state.db.conn(), user_id, &gw.address, "Main", Some(&enc), true)
+                    .await?;
+                Ok(format!(
+                    "✅ <b>Wallet created</b>\n\n\",
+                     📮 Address: <code>{}</code>\n\",
+                     🔑 Private key (shown once): <code>{}</code>\n\n\",
+                     ⚠️ Store it safely — it is encrypted at rest with your master key.",
+                    gw.address, gw.private_key_hex
+                ))
+            }
         }
         Some(rest) if rest.starts_with("import") => {
             let key = rest.trim_start_matches("import").trim();
-            let gw = crypto::import_wallet(key)
-                .context("invalid private key — expected 64 hex chars")?;
-            let enc = state.keyring.encrypt(gw.private_key_hex.as_bytes())?;
-            repo::insert_wallet(
-                state.db.conn(),
-                user_id,
-                &gw.address,
-                "Imported",
-                Some(&enc),
-                true,
-            )
-            .await?;
-            Ok(format!("✅ Imported wallet <code>{}</code>", gw.address))
+            // Auto-detect: EVM hex keys vs Solana base58 keys.
+            match crypto::import_wallet(key) {
+                Ok(gw) => {
+                    let enc = state.keyring.encrypt(gw.private_key_hex.as_bytes())?;
+                    repo::insert_wallet(state.db.conn(), user_id, &gw.address, "Imported", Some(&enc), true)
+                        .await?;
+                    Ok(format!("✅ Imported EVM wallet <code>{}</code>", gw.address))
+                }
+                Err(_) => {
+                    let sw = crypto::import_solana_wallet(key)
+                        .context("invalid private key — expected EVM hex (64 chars) or Solana base58 (Phantom-style)")?;
+                    let enc = state.keyring.encrypt(hex::decode(&sw.seed_hex)?.as_slice())?;
+                    repo::insert_wallet(state.db.conn(), user_id, &sw.address, "Imported", Some(&enc), true)
+                        .await?;
+                    Ok(format!("✅ Imported Solana wallet <code>{}</code>", sw.address))
+                }
+            }
         }
         Some(other) => Ok(format!(
             "Unknown wallet action <code>{}</code>.\nUse /wallet, /wallet new or /wallet import &lt;privkey&gt;.",
@@ -287,8 +313,10 @@ async fn cmd_balance(state: &AppState, msg: &Message, arg: Option<String>) -> Re
     // Optional <wallet-id> argument to pick a specific wallet.
     let wallet = if let Some(id_str) = arg.as_deref().and_then(|a| a.parse::<i64>().ok()) {
         wallets.iter().find(|w| w.id == id_str).context("wallet id not found")?
+    } else if chain.kind == crate::chains::ChainKind::Solana {
+        wallets.iter().find(|w| w.network == "solana").unwrap_or(&wallets[0])
     } else {
-        wallets.iter().find(|w| w.is_default).unwrap_or(&wallets[0])
+        wallets.iter().find(|w| w.network != "solana").unwrap_or(&wallets[0])
     };
 
     let native_usd = state.market.native_price_usd(chain).await;
@@ -299,17 +327,46 @@ async fn cmd_balance(state: &AppState, msg: &Message, arg: Option<String>) -> Re
     );
 
     // On-chain native balance.
-    match state.rpc.native_balance(chain, &wallet.address).await {
-        Ok(wei) => {
-            let bal = wei as f64 / 1e18;
-            s.push_str(&format!(
-                "⛽ {:.6} {} · <b>{}</b>\n",
-                bal,
-                chain.native,
-                format_usd(bal * native_usd)
-            ));
+    let native_bal: Option<f64> = match chain.kind {
+        crate::chains::ChainKind::Evm => match state.rpc.native_balance(chain, &wallet.address).await {
+            Ok(wei) => Some(wei as f64 / 1e18),
+            Err(e) => {
+                s.push_str(&format!("⚠️ native balance unavailable: {e}\n"));
+                None
+            }
+        },
+        crate::chains::ChainKind::Solana => match state.solana.balance(chain, &wallet.address).await {
+            Ok(lamports) => Some(lamports as f64 / 1e9),
+            Err(e) => {
+                s.push_str(&format!("⚠️ SOL balance unavailable: {e}\n"));
+                None
+            }
+        },
+    };
+    if let Some(bal) = native_bal {
+        s.push_str(&format!(
+            "⛽ {:.6} {} · <b>{}</b>\n",
+            bal,
+            chain.native,
+            format_usd(bal * native_usd)
+        ));
+    }
+
+    // Solana: show actual SPL holdings (top by USD value).
+    if chain.kind == crate::chains::ChainKind::Solana {
+        if let Ok(balances) = state.solana.spl_balances(chain, &wallet.address).await {
+            let mut items: Vec<(String, f64, f64)> = Vec::new();
+            for b in balances.iter().take(8) {
+                let q = state.market.quote(chain, &b.mint).await;
+                if q.price_usd > 0.0 {
+                    items.push((q.symbol, b.amount, q.price_usd * b.amount));
+                }
+            }
+            items.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            for (symbol, amount, usd) in items.iter().take(6) {
+                s.push_str(&format!("🪙 {:.4} <b>{}</b> · <b>{}</b>\n", amount, symbol, format_usd(*usd)));
+            }
         }
-        Err(e) => s.push_str(&format!("⚠️ native balance unavailable: {e}\n")),
     }
 
     // Curated ERC20 balances.
@@ -372,9 +429,7 @@ async fn cmd_buy(
     let chain = parse_token_arg(token_arg, state.user_chain(user_id).await)?;
     let token = chain.1;
     let chain = chain.0;
-    let wallet = repo::get_default_wallet(state.db.conn(), user_id)
-        .await?
-        .context("create a wallet first with /wallet new")?;
+    let wallet = wallet_for_chain(state, user_id, chain).await?;
     let slippage = user_slippage(state, user_id).await?;
 
     if side == "snipe" {
@@ -384,7 +439,8 @@ async fn cmd_buy(
         }
     }
 
-    if state.config.paper_trading || !state.swap.enabled() {
+    // Paper trading fills at live prices on every chain kind.
+    if state.config.paper_trading || (chain.kind == crate::chains::ChainKind::Evm && !state.swap.enabled()) {
         let receipt = state
             .engine
             .buy(
@@ -401,44 +457,79 @@ async fn cmd_buy(
         return Ok(fmt_buy_paper(&receipt, chain, side));
     }
 
-    // Live on-chain swap.
-    let secret = wallet_secret(state, &wallet)?;
-    let amount_wei = (amount * 1e18) as u128;
-    if amount_wei == 0 {
-        bail!("amount too small for a live swap");
+    match chain.kind {
+        crate::chains::ChainKind::Solana => {
+            // Live Solana swap via Jupiter (keyless).
+            let secret = wallet_secret(state, &wallet)?;
+            let res = state.solana.buy(chain, &token, amount, slippage, &wallet.address, &secret).await?;
+            if !res.success {
+                bail!("swap failed — tx {}", res.tx_signature);
+            }
+            let decimals = state.solana.token_decimals(chain, &token).await.unwrap_or(9);
+            let qty = res.token_amount as f64 / 10f64.powi(decimals as i32);
+            let price = res.price_native;
+            record_live_order(state, user_id, Some(wallet.id), chain, &token, side, amount, qty, price, slippage, &res.tx_signature).await?;
+            Ok(format!(
+                "{} <b>{}</b> filled <b>LIVE</b> 🔗 <a href=\"{}\" >{}</a>\n\n\
+                 Chain: <b>solana</b>\n\
+                 Token: <code>{}</code> ({})\n\
+                 Qty: <b>{}</b>\n\
+                 Price: <b>{}</b>\n\
+                 Spent: <b>{:.9} SOL</b>\n\
+                 Slippage: {:.2}%",
+                if side == "snipe" { "🛰️" } else { "✅" },
+                side.to_uppercase(),
+                res.explorer_link,
+                &res.tx_signature[..res.tx_signature.len().min(10)],
+                short_addr(&token),
+                token_symbol(state, chain, &token).await,
+                format_qty(qty),
+                format_price(price),
+                amount,
+                slippage * 100.0
+            ))
+        }
+        crate::chains::ChainKind::Evm => {
+            // Live EVM swap via 0x.
+            let secret = wallet_secret(state, &wallet)?;
+            let amount_wei = (amount * 1e18) as u128;
+            if amount_wei == 0 {
+                bail!("amount too small for a live swap");
+            }
+            let res = state
+                .swap
+                .buy_native(chain, &token, amount_wei, slippage, &wallet.address, &secret)
+                .await?;
+            if !res.success {
+                bail!("swap reverted — tx {}", res.tx_hash);
+            }
+            let decimals = state.rpc.erc20_decimals(chain, &token).await;
+            let qty = res.token_amount as f64 / 10f64.powi(decimals as i32);
+            let price = res.price_native;
+            record_live_order(state, user_id, Some(wallet.id), chain, &token, side, amount, qty, price, slippage, &res.tx_hash).await?;
+            Ok(format!(
+                "{} <b>{}</b> filled <b>LIVE</b> 🔗 <a href=\"{}\" >{}</a>\n\n\
+                 Chain: <b>{}</b>\n\
+                 Token: <code>{}</code> ({})\n\
+                 Qty: <b>{}</b>\n\
+                 Price: <b>{}</b>\n\
+                 Spent: <b>{:.6} {}</b>\n\
+                 Slippage: {:.2}%",
+                if side == "snipe" { "🛰️" } else { "✅" },
+                side.to_uppercase(),
+                res.explorer_link,
+                &res.tx_hash[..res.tx_hash.len().min(10)],
+                chain.id,
+                short_addr(&token),
+                token_symbol(state, chain, &token).await,
+                format_qty(qty),
+                format_price(price),
+                amount,
+                chain.native,
+                slippage * 100.0
+            ))
+        }
     }
-    let res = state
-        .swap
-        .buy_native(chain, &token, amount_wei, slippage, &wallet.address, &secret)
-        .await?;
-    if !res.success {
-        bail!("swap reverted — tx {}", res.tx_hash);
-    }
-    let decimals = state.rpc.erc20_decimals(chain, &token).await;
-    let qty = res.token_amount as f64 / 10f64.powi(decimals as i32);
-    let price = res.price_native;
-    record_live_order(state, user_id, Some(wallet.id), chain, &token, side, amount, qty, price, slippage, &res.tx_hash).await?;
-    Ok(format!(
-        "{} <b>{}</b> filled <b>LIVE</b> 🔗 <a href=\"{}\">{}</a>\n\n\
-         Chain: <b>{}</b>\n\
-         Token: <code>{}</code> ({})\n\
-         Qty: <b>{}</b>\n\
-         Price: <b>{}</b>\n\
-         Spent: <b>{:.6} {}</b>\n\
-         Slippage: {:.2}%",
-        if side == "snipe" { "🛰️" } else { "✅" },
-        side.to_uppercase(),
-        res.explorer_link,
-        &res.tx_hash[..res.tx_hash.len().min(10)],
-        chain.id,
-        short_addr(&token),
-        token_symbol(state, chain, &token).await,
-        format_qty(qty),
-        format_price(price),
-        amount,
-        chain.native,
-        slippage * 100.0
-    ))
 }
 
 async fn cmd_sell(
@@ -451,18 +542,26 @@ async fn cmd_sell(
     let chain = parse_token_arg(token_arg, state.user_chain(user_id).await)?;
     let token = chain.1;
     let chain = chain.0;
-    let wallet = repo::get_default_wallet(state.db.conn(), user_id)
-        .await?
-        .context("create a wallet first with /wallet new")?;
+    let wallet = wallet_for_chain(state, user_id, chain).await?;
     let slippage = user_slippage(state, user_id).await?;
 
     let position = repo::get_position(state.db.conn(), user_id, &token).await?;
-    let live = !state.config.paper_trading && state.swap.enabled();
+    let live = !state.config.paper_trading;
     let qty = if qty_arg == "all" || qty_arg == "max" {
         if live {
-            let raw = state.rpc.erc20_balance(chain, &token, &wallet.address).await?;
-            let decimals = state.rpc.erc20_decimals(chain, &token).await;
-            raw as f64 / 10f64.powi(decimals as i32)
+            match chain.kind {
+                crate::chains::ChainKind::Evm => {
+                    let raw = state.rpc.erc20_balance(chain, &token, &wallet.address).await?;
+                    let decimals = state.rpc.erc20_decimals(chain, &token).await;
+                    raw as f64 / 10f64.powi(decimals as i32)
+                }
+                crate::chains::ChainKind::Solana => {
+                    let balances = state.solana.spl_balances(chain, &wallet.address).await?;
+                    let b = balances.iter().find(|b| b.mint.eq_ignore_ascii_case(&token))
+                        .context("no on-chain balance for this token")?;
+                    b.amount
+                }
+            }
         } else {
             position.as_ref().context("no open position for this token")?.quantity
         }
@@ -475,7 +574,7 @@ async fn cmd_sell(
         bail!("quantity must be positive");
     }
 
-    if !live {
+    if !live || (chain.kind == crate::chains::ChainKind::Evm && !state.swap.enabled()) {
         let receipt = state
             .engine
             .sell(
@@ -491,44 +590,69 @@ async fn cmd_sell(
         return Ok(fmt_sell_paper(&receipt, chain));
     }
 
-    // Live on-chain swap.
-    let secret = wallet_secret(state, &wallet)?;
-    let res = state
-        .swap
-        .sell_tokens(chain, &token, qty, slippage, &wallet.address, &secret)
-        .await?;
-    if !res.success {
-        bail!("swap reverted — tx {}", res.tx_hash);
+    match chain.kind {
+        crate::chains::ChainKind::Solana => {
+            let secret = wallet_secret(state, &wallet)?;
+            let res = state.solana.sell(chain, &token, qty, slippage, &wallet.address, &secret).await?;
+            if !res.success {
+                bail!("swap failed — tx {}", res.tx_signature);
+            }
+            let proceeds = res.native_amount as f64 / 1e9;
+            let price = res.price_native;
+            record_live_order(state, user_id, Some(wallet.id), chain, &token, "sell", qty, proceeds, price, slippage, &res.tx_signature).await?;
+            Ok(format!(
+                "💸 <b>SELL</b> filled <b>LIVE</b> 🔗 <a href=\"{}\" >{}</a>\n\n\
+                 Chain: <b>solana</b>\n\
+                 Token: <code>{}</code> ({})\n\
+                 Qty: <b>{}</b>\n\
+                 Price: <b>{}</b>\n\
+                 Proceeds: <b>{:.9} SOL</b>{}",
+                res.explorer_link,
+                &res.tx_signature[..res.tx_signature.len().min(10)],
+                short_addr(&token),
+                token_symbol(state, chain, &token).await,
+                format_qty(qty),
+                format_price(price),
+                proceeds,
+                "",
+            ))
+        }
+        crate::chains::ChainKind::Evm => {
+            let secret = wallet_secret(state, &wallet)?;
+            let res = state
+                .swap
+                .sell_tokens(chain, &token, qty, slippage, &wallet.address, &secret)
+                .await?;
+            if !res.success {
+                bail!("swap reverted — tx {}", res.tx_hash);
+            }
+            let proceeds = res.native_amount as f64 / 1e18;
+            let price = res.price_native;
+            // record_live_order keeps paper accounting in sync (reduces when a position exists).
+            record_live_order(state, user_id, Some(wallet.id), chain, &token, "sell", qty, proceeds, price, slippage, &res.tx_hash).await?;
+            Ok(format!(
+                "💸 <b>SELL</b> filled <b>LIVE</b> 🔗 <a href=\"{}\" >{}</a>\n\n\
+                 Chain: <b>{}</b>\n\
+                 Token: <code>{}</code> ({})\n\
+                 Qty: <b>{}</b>\n\
+                 Price: <b>{}</b>\n\
+                 Proceeds: <b>{:.6} {}</b>{}",
+                res.explorer_link,
+                &res.tx_hash[..res.tx_hash.len().min(10)],
+                chain.id,
+                short_addr(&token),
+                token_symbol(state, chain, &token).await,
+                format_qty(qty),
+                format_price(price),
+                proceeds,
+                chain.native,
+                res.approval_tx
+                    .as_ref()
+                    .map(|h| format!("\n✅ allowance approved: <code>{}</code>", short_addr(h)))
+                    .unwrap_or_default(),
+            ))
+        }
     }
-    let proceeds = res.native_amount as f64 / 1e18;
-    let price = res.price_native;
-    // record_live_order keeps paper accounting in sync (reduces when a position exists).
-    record_live_order(state, user_id, Some(wallet.id), chain, &token, "sell", qty, proceeds, price, slippage, &res.tx_hash).await?;
-    Ok(format!(
-        "💸 <b>SELL</b> filled <b>LIVE</b> 🔗 <a href=\"{}\">{}</a>\n\n\
-         Chain: <b>{}</b>\n\
-         Token: <code>{}</code> ({})\n\
-         Qty: <b>{}</b>\n\
-         Price: <b>{}</b>\n\
-         Proceeds: <b>{:.6} {}</b>{}",
-        res.explorer_link,
-        &res.tx_hash[..res.tx_hash.len().min(10)],
-        chain.id,
-        short_addr(&token),
-        token_symbol(state, chain, &token).await,
-        format_qty(qty),
-        format_price(price),
-        proceeds,
-        chain.native,
-        res.approval_tx
-            .as_ref()
-            .map(|h| format!("\n✅ allowance approved: <code>{}</code>", short_addr(h)))
-            .unwrap_or_default(),
-    ))
-// ---------------------------------------------------------------------------
-// Handlers: market info / alerts / portfolio / history / trending
-// ---------------------------------------------------------------------------
-
 }
 
 async fn cmd_price(state: &AppState, msg: &Message, token_arg: &str) -> Result<String> {
@@ -639,35 +763,42 @@ async fn cmd_portfolio(state: &AppState, msg: &Message) -> Result<String> {
     if positions.is_empty() {
         return Ok("📂 No open positions. Start with /buy &lt;token&gt; &lt;amount&gt;.".to_string());
     }
-    let mut s = String::from("📂 <b>Portfolio</b>\n\n");
-    let mut total = 0.0;
-    let mut total_pnl = 0.0;
+
+    // Group positions per network for a per-chain view.
+    let mut groups: std::collections::BTreeMap<String, Vec<&crate::db::models::Position>> = Default::default();
     for p in &positions {
-        let chain = chains::by_id(&p.network).unwrap_or_else(|| chains::by_id("ethereum").unwrap());
-        let quote = state.market.quote(chain, &p.token_address).await;
-        let price = quote.price_native;
-        let value = p.quantity * price;
-        let pnl = (price - p.avg_price) * p.quantity;
-        total += value;
-        total_pnl += pnl;
-        s.push_str(&format!(
-            "<b>{}</b> <code>{}</code> · {}\n  qty {} @ {}\n  value <b>{:.6} {}</b> · PnL {}\n",
-            quote.symbol,
-            short_addr(&p.token_address),
-            chain.id,
-            format_qty(p.quantity),
-            format_price(p.avg_price),
-            value,
-            chain.native,
-            pnl_str(pnl, chain.native)
-        ));
+        groups.entry(p.network.clone()).or_default().push(p);
     }
-    s.push_str(&format!(
-        "\n💼 Total: <b>{:.6} {}</b> · 📊 PnL: <b>{}</b>",
-        total,
-        "native",
-        pnl_str(total_pnl, "native")
-    ));
+
+    let mut s = String::from("📂 <b>Portfolio</b>\n\n");
+    let mut grand_usd = 0.0;
+    for (network, list) in &groups {
+        let chain = chains::by_id(network).unwrap_or_else(|| chains::by_id("ethereum").unwrap());
+        let native_usd = state.market.native_price_usd(chain).await;
+        s.push_str(&format!("⛓️ <b>{}</b> · {}\n", chain.name, chain.native));
+        let mut chain_usd = 0.0;
+        for p in list {
+            let quote = state.market.quote(chain, &p.token_address).await;
+            let price = quote.price_native;
+            let value = p.quantity * price;
+            let value_usd = value * native_usd;
+            let pnl = (price - p.avg_price) * p.quantity;
+            chain_usd += value_usd;
+            s.push_str(&format!(
+                "  <b>{}</b> <code>{}</code>\n    qty {} @ {} · value <b>{:.6} {}</b> · PnL {}\n",
+                quote.symbol,
+                short_addr(&p.token_address),
+                format_qty(p.quantity),
+                format_price(p.avg_price),
+                value,
+                chain.native,
+                pnl_str(pnl, chain.native)
+            ));
+        }
+        s.push_str(&format!("  Σ <b>{}</b>\n\n", format_usd(chain_usd)));
+        grand_usd += chain_usd;
+    }
+    s.push_str(&format!("💼 <b>Total portfolio: {}</b>", format_usd(grand_usd)));
     Ok(s)
 }
 
@@ -727,6 +858,53 @@ async fn cmd_trending(state: &AppState, msg: &Message) -> Result<String> {
     }
     s.push_str("\nInspect any with /token &lt;chain:address&gt;");
     Ok(s)
+}
+
+async fn cmd_find(state: &AppState, msg: &Message, q: &str) -> Result<String> {
+    let _ = ensure_user(state, msg).await?;
+    let results = state.market.search(q).await;
+    if results.is_empty() {
+        return Ok(format!("🔍 No results for <code>{}</code>. Try a ticker like /find pepe.", sanitize_html(q)));
+    }
+    let mut s = format!("🔍 <b>Search: {}</b>\n\n", sanitize_html(q));
+    for r in results.iter().take(10) {
+        s.push_str(&format!(
+            "<b>{}</b> · {} · <code>{}</code>\n",
+            r.symbol, r.chain, r.address
+        ));
+        s.push_str(&format!(
+            "   {} · liq {} · vol {} · 24h <b>{:+.1}%</b>\n",
+            format_price(r.price_usd),
+            format_usd(r.liquidity_usd),
+            format_usd(r.volume_24h_usd),
+            r.price_change_24h
+        ));
+    }
+    s.push_str("\nTrade: /buy &lt;chain:address&gt; &lt;amount&gt;");
+    Ok(s)
+}
+
+async fn cmd_boosts(state: &AppState, msg: &Message) -> Result<String> {
+    let _ = ensure_user(state, msg).await?;
+    let boosts = state.market.boosts().await;
+    if boosts.is_empty() {
+        return Ok("🚀 No boosted tokens right now (offline or rate-limited).".to_string());
+    }
+    let mut s = String::from("🚀 <b>Top boosted tokens</b> (DexScreener)\n\n");
+    for b in boosts.iter().take(10) {
+        s.push_str(&format!(
+            "<code>{}</code> <b>{}</b> · <code>{}</code>\n",
+            b.chain,
+            short_addr(&b.address),
+            b.address
+        ));
+    }
+    s.push_str("\nInspect with /token &lt;chain:address&gt;");
+    Ok(s)
+}
+
+fn sanitize_html(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 async fn cmd_settings(state: &AppState, msg: &Message, arg: Option<String>) -> Result<String> {
@@ -893,6 +1071,26 @@ async fn user_slippage(state: &AppState, user_id: i64) -> Result<f64> {
     }
 }
 
+
+/// Default wallet for a chain: Solana wallets are separate from EVM wallets.
+async fn wallet_for_chain(
+    state: &AppState,
+    user_id: i64,
+    chain: &Chain,
+) -> Result<crate::db::models::Wallet> {
+    let network = if chain.kind == crate::chains::ChainKind::Solana { "solana" } else { "ethereum" };
+    match repo::get_default_wallet_for(state.db.conn(), user_id, network).await? {
+        Some(w) => Ok(w),
+        None => {
+            let hint = if chain.kind == crate::chains::ChainKind::Solana {
+                "create a Solana wallet first with /wallet new solana"
+            } else {
+                "create a wallet first with /wallet new"
+            };
+            Err(anyhow::anyhow!("{}", hint))
+        }
+    }
+}
 /// Parse `chain:0x…` / `0x…` token arguments.
 fn parse_token_arg(input: &str, default: &'static Chain) -> Result<(&'static Chain, String)> {
     Chain::resolve_token_arg(input, default)
@@ -1052,7 +1250,7 @@ fn alert_note(fired: i64) -> String {
 
 fn help_text() -> &'static str {
     "⚡ <b>Velocidad commands</b>\n\n\
-     👛 /wallet — list wallets · /wallet new · /wallet import &lt;key&gt;\n\
+     👛 /wallet — list · /wallet new [solana] · /wallet import &lt;key&gt;\n\
      ⛓️ /chain — set default chain · /chains — list chains\n\
      🟢 /buy &lt;token&gt; &lt;amount&gt; — instant buy\n\
      🔴 /sell &lt;token&gt; &lt;qty|all&gt; — sell\n\
@@ -1062,11 +1260,14 @@ fn help_text() -> &'static str {
      🔬 /scan &lt;token&gt; — security scan\n\
      🔔 /alert &lt;token&gt; &lt;above|below&gt; &lt;price&gt; — price alert\n\
      🔥 /trending — trending tokens\n\
+     🚀 /boosts — top boosted tokens\n\
+     🔍 /find &lt;ticker&gt; — search tokens by name/symbol\n\
      💰 /balance — on-chain balances\n\
-     📂 /portfolio — positions + PnL\n\
+     📂 /portfolio — positions + PnL (all chains)\n\
      🧾 /history — recent orders\n\
      ⚙️ /settings — slippage etc.\n\n\
-     <b>Multi-chain</b>: prefix any token with <code>chain:</code>,\n\
-     e.g. <code>/buy bsc:0x… 0.5</code>"
+     <b>Multi-chain</b>: prefix any token with <code>chain:</code>\n\
+     (<code>eth:</code> <code>bsc:</code> <code>sol:</code> …),\n\
+     e.g. <code>/buy sol:EPjF… 0.5</code>"
 }
 

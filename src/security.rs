@@ -158,7 +158,13 @@ impl TokenScanner {
 
         let mut is_honeypot = false;
         let mut source = "dexscreener";
-        if let Some(hp) = self.check_honeypot_is(chain, token).await {
+        if chain.kind == crate::chains::ChainKind::Solana {
+            checks.push(CheckResult {
+                name: "Honeypot pattern",
+                passed: true,
+                note: "Solana has no honeypot simulation — liquidity/age based".to_string(),
+            });
+        } else if let Some(hp) = self.check_honeypot_is(chain, token).await {
             is_honeypot = hp.is_honeypot;
             source = "honeypot";
             let buy_tax = hp.buy_tax;

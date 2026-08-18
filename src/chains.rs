@@ -13,11 +13,20 @@
 //! - wrapped-native address (native price discovery via DexScreener)
 //! - curated default ERC20s for `/balance` display
 
-/// A registered EVM chain.
+/// What kind of chain this is — EVM (ERC-20, EIP-1559) or Solana (SPL, ed25519).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainKind {
+    Evm,
+    Solana,
+}
+
+/// A registered chain (EVM or Solana).
 pub struct Chain {
-    /// Canonical slug, e.g. `"ethereum"`, `"bsc"`. Used in the DB and commands.
+    /// Canonical slug, e.g. `"ethereum"`, `"bsc"`, `"solana"`.
     pub id: &'static str,
-    /// EIP-155 numeric chain id.
+    /// Chain kind: EVM or Solana.
+    pub kind: ChainKind,
+    /// EIP-155 numeric chain id (EVMs only; 101 is Solana's ecosystem id).
     pub chain_id: u64,
     /// Display name, e.g. `"BNB Smart Chain"`.
     pub name: &'static str,
@@ -44,6 +53,7 @@ macro_rules! chain {
      $explorer:expr, $dex:expr, $fallback_usd:expr, $rpc:expr, $erc20s:expr) => {
         Chain {
             id: $id,
+            kind: ChainKind::Evm,
             chain_id: $chain_id,
             name: $name,
             native: $native,
@@ -57,8 +67,26 @@ macro_rules! chain {
     };
 }
 
-/// All supported EVM chains, in display order.
+/// All supported chains, in display order.
 pub static CHAINS: &[Chain] = &[
+    // Solana — not an EVM chain: SPL tokens, ed25519 keys, base58 addresses.
+    Chain {
+        id: "solana",
+        kind: ChainKind::Solana,
+        chain_id: 101,
+        name: "Solana",
+        native: "SOL",
+        wrapped_native: "So11111111111111111111111111111111111111112", // WSOL
+        rpc_urls: &[
+            "https://api.mainnet-beta.solana.com",
+            "https://solana-rpc.publicnode.com",
+            "https://rpc.ankr.com/solana",
+        ],
+        explorer: "https://solscan.io",
+        dex_segment: "solana",
+        fallback_native_usd: 150.0,
+        default_erc20s: &[],
+    },
     chain!(
         "ethereum", 1, "Ethereum", "ETH",
         "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
@@ -219,8 +247,10 @@ impl Chain {
         })
     }
 
-    /// Resolve `"chain:0x…"` or `"0x…"` token arguments — returns the chain
-    /// (explicit or default) and the bare address.
+    /// Resolve `"chain:token"` or bare `"token"` arguments — returns the chain
+    /// (explicit or default) and the bare token address. Token addresses are
+    /// 0x-hex on EVMs and base58 on Solana, so no format check happens here
+    /// (the risk manager validates per chain kind).
     pub fn resolve_token_arg(
         input: &str,
         default_chain: &'static Chain,
@@ -228,12 +258,15 @@ impl Chain {
         let t = input.trim();
         if let Some((prefix, addr)) = t.split_once(':') {
             let addr = addr.trim();
-            if !addr.starts_with("0x") {
+            if addr.is_empty() {
                 return None;
             }
             let chain = Chain::resolve(prefix)?;
             Some((chain, addr.to_string()))
         } else {
+            if t.is_empty() {
+                return None;
+            }
             Some((default_chain, t.to_string()))
         }
     }
@@ -251,6 +284,7 @@ impl Chain {
 
 fn alias_matches(id: &str, lower: &str) -> bool {
     match id {
+        "solana" => matches!(lower, "sol"),
         "ethereum" => matches!(lower, "eth" | "ether"),
         "bsc" => matches!(lower, "bnb" | "binance" | "bep20"),
         "polygon" => matches!(lower, "matic" | "pol"),
@@ -284,7 +318,8 @@ mod tests {
         assert_eq!(Chain::resolve("avax").unwrap().id, "avalanche");
         assert_eq!(Chain::resolve("chain:base").unwrap().id, "base");
         assert_eq!(Chain::resolve("xdai").unwrap().id, "gnosis");
-        assert!(Chain::resolve("solana").is_none());
+        assert_eq!(Chain::resolve("solana").unwrap().id, "solana");
+        assert_eq!(Chain::resolve("sol").unwrap().id, "solana");
         assert!(Chain::resolve("999999999").is_none());
     }
 
@@ -297,7 +332,11 @@ mod tests {
         let (c, addr) = Chain::resolve_token_arg("0xdeadbeef", eth).unwrap();
         assert_eq!(c.id, "ethereum");
         assert_eq!(addr, "0xdeadbeef");
-        assert!(Chain::resolve_token_arg("bsc:nothex", eth).is_none());
+        // Non-hex addresses are accepted (Solana base58 mints) and validated
+        // later by the risk manager per chain kind.
+        let (c, addr) = Chain::resolve_token_arg("sol:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", eth).unwrap();
+        assert_eq!(c.id, "solana");
+        assert!(addr.starts_with("EPj"));
         assert!(Chain::resolve_token_arg("nosuchchain:0xabc", eth).is_none());
     }
 
@@ -308,7 +347,9 @@ mod tests {
         for c in CHAINS {
             assert!(seen_ids.insert(c.chain_id), "duplicate chain id {}", c.chain_id);
             assert!(seen_slugs.insert(c.id), "duplicate id {}", c.id);
-            assert_eq!(c.wrapped_native.len(), 42, "bad wrapped native for {}", c.id);
+            if c.kind == ChainKind::Evm {
+                assert_eq!(c.wrapped_native.len(), 42, "bad wrapped native for {}", c.id);
+            }
             assert!(!c.rpc_urls.is_empty());
         }
     }

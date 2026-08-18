@@ -111,6 +111,7 @@ impl Keyring {
         Ok(hex::encode(blob))
     }
 
+
     /// Decrypt hex(nonce || ciphertext) → plaintext.
     ///
     /// Used when signing live transactions with a stored wallet key.
@@ -126,5 +127,99 @@ impl Keyring {
         cipher
             .decrypt(nonce, ciphertext)
             .map_err(|_| anyhow!("decryption failed (wrong master key?)"))
+    }
+}
+
+
+
+// ---------------------------------------------------------------------------
+// Solana wallets — ed25519 keypairs with base58 addresses.
+// ---------------------------------------------------------------------------
+//
+// A Solana keypair is 64 bytes (32-byte seed || 32-byte public key); the
+// address is base58(public key). We store only the 32-byte seed at rest
+// (same encrypted-keyring flow as EVM wallets) and reconstruct the public
+// key for signing.
+
+/// Generated or imported Solana keypair material.
+pub struct SolanaWallet {
+    pub address: String,
+    /// 32-byte seed, hex-encoded — this is what gets encrypted at rest.
+    pub seed_hex: String,
+    /// Phantom-style base58 private key (64 bytes), shown once at creation.
+    pub private_key_base58: String,
+}
+
+/// Generate a fresh Solana keypair.
+pub fn generate_solana_wallet() -> Result<SolanaWallet> {
+    let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    solana_wallet_from(&sk)
+}
+
+/// Import a Solana keypair from a private key in base58 (Phantom-style 64
+/// bytes) or hex (32-byte seed), with or without a 0x prefix.
+pub fn import_solana_wallet(input: &str) -> Result<SolanaWallet> {
+    let cleaned = input.trim();
+    let bytes = if cleaned.starts_with("0x") {
+        hex::decode(cleaned.trim_start_matches("0x")).context("invalid hex private key")?
+    } else if cleaned.len() == 64 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+        hex::decode(cleaned).context("invalid hex private key")?
+    } else {
+        bs58::decode(cleaned)
+            .into_vec()
+            .context("invalid base58 private key — expected a Phantom-style 64-byte key or a 32-byte seed")?
+    };
+    let seed: [u8; 32] = match bytes.len() {
+        32 => bytes.try_into().expect("length checked"),
+        64 => bytes[..32].try_into().expect("length checked"),
+        n => bail!("solana private key must be 32 or 64 bytes, got {n}"),
+    };
+    let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+    solana_wallet_from(&sk)
+}
+
+/// Derive address + display key from a signing key.
+fn solana_wallet_from(sk: &ed25519_dalek::SigningKey) -> Result<SolanaWallet> {
+    let pubkey = sk.verifying_key().to_bytes();
+    let address = bs58::encode(pubkey).into_string();
+    let mut secret = [0u8; 64];
+    secret[..32].copy_from_slice(&sk.to_bytes());
+    secret[32..].copy_from_slice(&pubkey);
+    Ok(SolanaWallet {
+        address,
+        seed_hex: hex::encode(sk.to_bytes()),
+        private_key_base58: bs58::encode(secret).into_string(),
+    })
+}
+
+#[cfg(test)]
+mod solana_tests {
+    use super::*;
+
+    #[test]
+    fn address_from_seed_one_matches_web3js() {
+        // Golden vector generated with @solana/web3.js v1 (independent impl):
+        // Keypair.fromSeed(new Uint8Array(32).fill(1)).publicKey.toBase58()
+        let seed = [1u8; 32];
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let w = solana_wallet_from(&sk).unwrap();
+        assert_eq!(w.address, "AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9");
+        assert_eq!(w.seed_hex.len(), 64);
+    }
+
+    #[test]
+    fn import_roundtrip() {
+        let w = generate_solana_wallet().unwrap();
+        let imported = import_solana_wallet(&w.private_key_base58).unwrap();
+        assert_eq!(imported.address, w.address);
+        assert_eq!(imported.seed_hex, w.seed_hex);
+        let from_seed = import_solana_wallet(&w.seed_hex).unwrap();
+        assert_eq!(from_seed.address, w.address);
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(import_solana_wallet("not-a-key").is_err());
+        assert!(import_solana_wallet("0x1234").is_err());
     }
 }

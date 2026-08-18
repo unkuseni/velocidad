@@ -88,6 +88,34 @@ pub async fn list_wallets(conn: &Connection, user_id: i64) -> Result<Vec<Wallet>
     Ok(out)
 }
 
+/// Default wallet for a specific network (e.g. `"ethereum"` vs `"solana"`).
+pub async fn get_default_wallet_for(
+    conn: &Connection,
+    user_id: i64,
+    network: &str,
+) -> Result<Option<Wallet>> {
+    let mut rows = conn
+        .query(
+            "SELECT id, user_id, address, network, label, encrypted_key, is_default, created_at
+             FROM wallets WHERE user_id = ?1 AND network = ?2 ORDER BY is_default DESC, id ASC LIMIT 1",
+            params![user_id, network],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some(Wallet {
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        address: row.get(2)?,
+        network: row.get(3)?,
+        label: row.get(4)?,
+        encrypted_key: row.get(5)?,
+        is_default: row.get::<i64>(6)? != 0,
+        created_at: row.get(7)?,
+    }))
+}
+
 pub async fn get_default_wallet(conn: &Connection, user_id: i64) -> Result<Option<Wallet>> {
     let mut rows = conn
         .query(
