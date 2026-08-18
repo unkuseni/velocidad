@@ -7,7 +7,7 @@
 //! - `API_PORT`          — HTTP API port (default `8080`)
 //! - `PAPER_TRADING`     — `true` = simulated fills, no real blockchain calls (default `true`)
 //! - `MASTER_KEY`        — 64-hex-char AES key used to encrypt wallet private keys.
-//!                         If absent, a key is generated and persisted to `./velocidad.key`.
+//!   If absent, a key is generated and persisted to `./velocidad.key`.
 
 use figment::providers::Env;
 use figment::Figment;
@@ -71,6 +71,14 @@ pub struct Config {
     /// the API runs open (dev mode) with a startup warning.
     #[serde(default)]
     pub api_key: Option<String>,
+
+    /// Max bot commands per user per minute (sliding window; 0 disables).
+    #[serde(default = "default_bot_rate")]
+    pub bot_rate_per_min: u64,
+
+    /// Max HTTP API requests per IP per minute (sliding window; 0 disables).
+    #[serde(default = "default_api_rate")]
+    pub api_rate_per_min: u64,
 }
 
 fn default_chain() -> String {
@@ -83,6 +91,14 @@ fn default_database_url() -> String {
 
 fn default_api_port() -> u16 {
     8080
+}
+
+fn default_bot_rate() -> u64 {
+    30
+}
+
+fn default_api_rate() -> u64 {
+    120
 }
 
 fn default_true() -> bool {
@@ -110,10 +126,60 @@ impl Config {
                 "SPONSOR_KEY",
                 "SPONSOR_SOLANA_KEY",
                 "API_KEY",
+                "BOT_RATE_PER_MIN",
+                "API_RATE_PER_MIN",
             ]))
             .merge(Env::prefixed("VELOCIDAD_").split("_"))
             .extract()?;
+        config.validate();
         Ok(config)
+    }
+
+    /// Non-fatal startup warnings for misconfigurations that would otherwise
+    /// surface as confusing runtime errors.
+    pub fn validate(&self) {
+        if !self.paper_trading
+            && self
+                .zeroex_api_key
+                .as_deref()
+                .map(|k| k.trim().is_empty())
+                .unwrap_or(true)
+        {
+            tracing::warn!(
+                "PAPER_TRADING=false but ZEROEX_API_KEY is not set — live EVM swaps will fail"
+            );
+        }
+        if self.paper_trading && (self.sponsor_key.is_some() || self.sponsor_solana_key.is_some()) {
+            tracing::warn!(
+                "gas-sponsorship keys are set but PAPER_TRADING=true — sponsorship is unused"
+            );
+        }
+        if self.sponsor_key.is_some() && self.zeroex_api_key.is_none() {
+            tracing::warn!(
+                "SPONSOR_KEY is set but ZEROEX_API_KEY is missing — sponsored EVM swaps will fail"
+            );
+        }
+        if !self.default_chain.trim().is_empty()
+            && crate::chains::by_id(&self.default_chain.trim().to_lowercase()).is_none()
+        {
+            tracing::warn!(
+                chain = %self.default_chain,
+                "DEFAULT_CHAIN is not a known chain — falling back to ethereum"
+            );
+        }
+        if self.teloxide_token.trim().is_empty() {
+            tracing::warn!("TELOXIDE_TOKEN is empty — the Telegram bot is disabled");
+        }
+        if self
+            .api_key
+            .as_deref()
+            .map(|k| k.trim().is_empty())
+            .unwrap_or(true)
+        {
+            tracing::warn!(
+                "API_KEY is not set — the HTTP API runs open. Set API_KEY to require a bearer token."
+            );
+        }
     }
 
     /// True when the configured database is a remote Turso instance.

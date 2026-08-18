@@ -117,7 +117,12 @@ impl TokenScanner {
 
     /// Real-data scan: liquidity, age, buy/sell pressure, price action,
     /// optional honeypot.is simulation.
-    async fn scan_live(&self, chain: &Chain, token: &str, quote: &crate::market::TokenQuote) -> TokenReport {
+    async fn scan_live(
+        &self,
+        chain: &Chain,
+        token: &str,
+        quote: &crate::market::TokenQuote,
+    ) -> TokenReport {
         let now = chrono::Utc::now().timestamp();
         let age_secs = quote
             .pair_created_at
@@ -127,13 +132,14 @@ impl TokenScanner {
         let liquidity_ok = quote.liquidity_usd >= 10_000.0;
         let age_ok = age_secs >= 3600;
         let rugged = quote.price_change_24h <= -80.0;
-        let sell_pressure = quote.txns_sell_24h > quote.txns_buy_24h * 3 && quote.txns_sell_24h >= 20;
+        let sell_pressure =
+            quote.txns_sell_24h > quote.txns_buy_24h * 3 && quote.txns_sell_24h >= 20;
 
         let mut checks = vec![
             CheckResult {
                 name: "Liquidity",
                 passed: liquidity_ok,
-                note: format!("{}", crate::market::format_usd(quote.liquidity_usd)),
+                note: crate::market::format_usd(quote.liquidity_usd).to_string(),
             },
             CheckResult {
                 name: "Pair age",
@@ -152,7 +158,10 @@ impl TokenScanner {
             CheckResult {
                 name: "Buy/sell pressure",
                 passed: !sell_pressure,
-                note: format!("{} buys / {} sells", quote.txns_buy_24h, quote.txns_sell_24h),
+                note: format!(
+                    "{} buys / {} sells",
+                    quote.txns_buy_24h, quote.txns_sell_24h
+                ),
             },
         ];
 
@@ -175,7 +184,11 @@ impl TokenScanner {
                 note: if hp.is_honeypot {
                     hp.reason.clone().unwrap_or_else(|| "trapped".to_string())
                 } else {
-                    format!("buy {:.1}% / sell {:.1}% tax", buy_tax * 100.0, sell_tax * 100.0)
+                    format!(
+                        "buy {:.1}% / sell {:.1}% tax",
+                        buy_tax * 100.0,
+                        sell_tax * 100.0
+                    )
                 },
             });
         } else {
@@ -187,7 +200,8 @@ impl TokenScanner {
         }
 
         let failed = checks.iter().filter(|c| !c.passed).count();
-        let risk_score = (5 + failed as u64 * 18 + (quote.price_change_24h.abs() as u64 % 5)).min(100) as u8;
+        let risk_score =
+            (5 + failed as u64 * 18 + (quote.price_change_24h.abs() as u64 % 5)).min(100) as u8;
 
         TokenReport {
             address: token.to_string(),
@@ -220,24 +234,39 @@ impl TokenScanner {
             },
             CheckResult {
                 name: "Ownership renounced",
-                passed: seed % 3 != 0,
-                note: if seed % 3 == 0 { "admin key still active" } else { "renounced" }.to_string(),
+                passed: !seed.is_multiple_of(3),
+                note: if seed.is_multiple_of(3) {
+                    "admin key still active"
+                } else {
+                    "renounced"
+                }
+                .to_string(),
             },
             CheckResult {
                 name: "Transfer tax",
-                passed: seed % 5 != 0,
-                note: if seed % 5 == 0 { "suspicious buy/sell tax" } else { "≤ 5%" }.to_string(),
+                passed: !seed.is_multiple_of(5),
+                note: if seed.is_multiple_of(5) {
+                    "suspicious buy/sell tax"
+                } else {
+                    "≤ 5%"
+                }
+                .to_string(),
             },
             CheckResult {
                 name: "Honeypot pattern",
-                passed: seed % 7 != 0,
-                note: if seed % 7 == 0 { "can't sell — honeypot" } else { "none detected" }.to_string(),
+                passed: !seed.is_multiple_of(7),
+                note: if seed.is_multiple_of(7) {
+                    "can't sell — honeypot"
+                } else {
+                    "none detected"
+                }
+                .to_string(),
             },
         ];
 
         let failed = checks.iter().filter(|c| !c.passed).count();
         let risk_score = (5 + failed as u64 * 20 + seed % 5).min(100) as u8;
-        let is_honeypot = seed % 7 == 0;
+        let is_honeypot = seed.is_multiple_of(7);
 
         TokenReport {
             address: token.to_string(),
@@ -256,7 +285,10 @@ impl TokenScanner {
     /// Live honeypot.is check (requires `HONEYPOT_API_KEY`).
     async fn check_honeypot_is(&self, chain: &Chain, token: &str) -> Option<HoneypotInfo> {
         let key = self.honeypot_key.as_ref()?;
-        let url = format!("https://api.honeypot.is/v2/IsHoneypot?chainID={}&address={}", chain.chain_id, token);
+        let url = format!(
+            "https://api.honeypot.is/v2/IsHoneypot?chainID={}&address={}",
+            chain.chain_id, token
+        );
         let mut req = self.http.get(&url);
         if !key.is_empty() {
             req = req.header("X-API-Key", key);

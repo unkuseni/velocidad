@@ -130,7 +130,7 @@ const MIGRATIONS: &[&str] = &[
     // exists on multiple chains (e.g. WETH on Optimism + Base). Zero-quantity
     // rows are kept so realized PnL aggregates survive full closes.
     r#"
-    CREATE TABLE positions_v2 (
+    CREATE TABLE IF NOT EXISTS positions_v2 (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id       INTEGER NOT NULL REFERENCES users(id),
         wallet_id     INTEGER REFERENCES wallets(id),
@@ -145,13 +145,14 @@ const MIGRATIONS: &[&str] = &[
     "#,
     r#"
     INSERT INTO positions_v2 (id, user_id, wallet_id, token_address, network, quantity, avg_price, realized_pnl, updated_at)
-        SELECT id, user_id, wallet_id, token_address, network, quantity, avg_price, realized_pnl, updated_at FROM positions;
+        SELECT id, user_id, wallet_id, token_address, network, quantity, avg_price, realized_pnl, updated_at FROM positions
+        WHERE NOT EXISTS (SELECT 1 FROM positions_v2);
     "#,
-    r#"DROP TABLE positions;"#,
+    r#"DROP TABLE IF EXISTS positions;"#,
     r#"ALTER TABLE positions_v2 RENAME TO positions;"#,
     // Tokens: (network, address) composite key.
     r#"
-    CREATE TABLE tokens_v2 (
+    CREATE TABLE IF NOT EXISTS tokens_v2 (
         network     TEXT NOT NULL DEFAULT 'ethereum',
         address     TEXT NOT NULL,
         name        TEXT,
@@ -167,9 +168,10 @@ const MIGRATIONS: &[&str] = &[
     "#,
     r#"
     INSERT INTO tokens_v2 (network, address, name, symbol, decimals, risk_score, is_honeypot, liquidity, last_price, updated_at)
-        SELECT network, address, name, symbol, decimals, risk_score, is_honeypot, liquidity, last_price, updated_at FROM tokens;
+        SELECT network, address, name, symbol, decimals, risk_score, is_honeypot, liquidity, last_price, updated_at FROM tokens
+        WHERE NOT EXISTS (SELECT 1 FROM tokens_v2);
     "#,
-    r#"DROP TABLE tokens;"#,
+    r#"DROP TABLE IF EXISTS tokens;"#,
     r#"ALTER TABLE tokens_v2 RENAME TO tokens;"#,
 ];
 
@@ -211,7 +213,9 @@ impl Db {
                 .context("failed to build local libSQL database")?
         };
 
-        let conn = db.connect().context("failed to acquire libSQL connection")?;
+        let conn = db
+            .connect()
+            .context("failed to acquire libSQL connection")?;
 
         let this = Self { conn };
         this.migrate().await?;
@@ -254,6 +258,34 @@ impl Db {
                 continue;
             }
 
+            // SQLite has no ADD COLUMN IF NOT EXISTS: if a previous run added
+            // the column but crashed before recording the migration, skip it.
+            if let Some((table, column)) = add_column_target(sql) {
+                let exists: i64 = self
+                    .conn
+                    .query(
+                        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                        libsql::params![table, column],
+                    )
+                    .await?
+                    .next()
+                    .await?
+                    .map(|row| row.get::<i64>(0))
+                    .transpose()?
+                    .unwrap_or(0);
+                if exists > 0 {
+                    tracing::info!(name, "column already exists — skipping migration");
+                    let tx = self.conn.transaction().await?;
+                    tx.execute(
+                        "INSERT INTO _migrations (name) VALUES (?1)",
+                        libsql::params![name],
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    continue;
+                }
+            }
+
             tracing::info!(name, "applying migration");
             let tx = self.conn.transaction().await?;
             tx.execute(sql, ()).await?;
@@ -266,6 +298,18 @@ impl Db {
         }
         Ok(())
     }
+}
+
+/// Parse "ALTER TABLE <t> ADD COLUMN <c> ..." into (table, column), if the
+/// statement is one. Used to make column additions re-runnable.
+fn add_column_target(sql: &str) -> Option<(&str, &str)> {
+    let s = sql.trim_start();
+    let rest = s.strip_prefix("ALTER TABLE")?.trim_start();
+    let (table, rest) = rest.split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("ADD COLUMN")?.trim_start();
+    let (column, _) = rest.split_once(char::is_whitespace)?;
+    Some((table, column))
 }
 
 /// Turso URLs sometimes embed the token as basic-auth, e.g.

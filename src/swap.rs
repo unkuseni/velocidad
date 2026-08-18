@@ -112,7 +112,6 @@ struct QuoteError {
     reasons: Option<serde_json::Value>,
 }
 
-
 /// Tracks the last-used transaction nonce per (chain, signer) so concurrent
 /// commands never double-spend a nonce (which would drop one of the txs).
 /// Uses a tokio mutex so the guard may be held across the RPC fetch
@@ -202,7 +201,10 @@ impl SwapClient {
 
     /// Live swaps require an API key configured at startup.
     pub fn enabled(&self) -> bool {
-        self.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false)
+        self.api_key
+            .as_ref()
+            .map(|k| !k.trim().is_empty())
+            .unwrap_or(false)
     }
 
     /// Fetch a 0x v2 quote.
@@ -248,15 +250,22 @@ impl SwapClient {
                     anyhow::bail!("0x API {status}: {msg}");
                 }
             }
-            anyhow::bail!("0x API returned {status}: {}", text.chars().take(300).collect::<String>());
+            anyhow::bail!(
+                "0x API returned {status}: {}",
+                text.chars().take(300).collect::<String>()
+            );
         }
 
         let parsed: QuoteResponse = serde_json::from_str(&text)?;
         let tx = parsed
             .transaction
             .ok_or_else(|| anyhow::anyhow!("0x quote missing transaction"))?;
-        let to = tx.to.ok_or_else(|| anyhow::anyhow!("0x quote missing transaction.to"))?;
-        let data = tx.data.ok_or_else(|| anyhow::anyhow!("0x quote missing transaction.data"))?;
+        let to = tx
+            .to
+            .ok_or_else(|| anyhow::anyhow!("0x quote missing transaction.to"))?;
+        let data = tx
+            .data
+            .ok_or_else(|| anyhow::anyhow!("0x quote missing transaction.data"))?;
 
         let buy_amount = parse_quantity(parsed.buy_amount.as_deref().unwrap_or("0"))?;
         let sell_amount = parse_quantity(parsed.sell_amount.as_deref().unwrap_or("0"))?;
@@ -269,8 +278,17 @@ impl SwapClient {
         let gas_price = parse_quantity(tx.gas_price.as_deref().unwrap_or("0"))?;
         let value = parse_quantity(tx.value.as_deref().unwrap_or("0"))?;
 
-        let allowance_target = parsed.issues.as_ref().and_then(|i| i.allowance.as_ref()).and_then(|a| a.spender.clone());
-        let balance_ok = parsed.issues.as_ref().and_then(|i| i.balance.as_ref()).map(|b| b.amount.is_none()).unwrap_or(true);
+        let allowance_target = parsed
+            .issues
+            .as_ref()
+            .and_then(|i| i.allowance.as_ref())
+            .and_then(|a| a.spender.clone());
+        let balance_ok = parsed
+            .issues
+            .as_ref()
+            .and_then(|i| i.balance.as_ref())
+            .map(|b| b.amount.is_none())
+            .unwrap_or(true);
         if parsed.liquidity_available == Some(false) {
             anyhow::bail!("0x API: no liquidity available for this pair");
         }
@@ -279,7 +297,11 @@ impl SwapClient {
         }
 
         // Effective price in native units: for buys sellAmount is native.
-        let price_native = if buy_amount > 0 { sell_amount as f64 / buy_amount as f64 } else { 0.0 };
+        let price_native = if buy_amount > 0 {
+            sell_amount as f64 / buy_amount as f64
+        } else {
+            0.0
+        };
 
         Ok(SwapQuote {
             buy_amount,
@@ -301,9 +323,11 @@ impl SwapClient {
 pub fn parse_quantity(s: &str) -> anyhow::Result<u128> {
     let t = s.trim();
     if let Some(hex) = t.strip_prefix("0x") {
-        return u128::from_str_radix(hex, 16).map_err(|e| anyhow::anyhow!("bad hex quantity {t}: {e}"));
+        return u128::from_str_radix(hex, 16)
+            .map_err(|e| anyhow::anyhow!("bad hex quantity {t}: {e}"));
     }
-    t.parse::<u128>().map_err(|e| anyhow::anyhow!("bad quantity {t}: {e}"))
+    t.parse::<u128>()
+        .map_err(|e| anyhow::anyhow!("bad quantity {t}: {e}"))
 }
 
 /// 0x sentinel address for the native coin.
@@ -322,7 +346,7 @@ pub struct Tx1559 {
 }
 
 /// Result of a live swap, ready to render.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct LiveTradeResult {
     pub tx_hash: String,
     pub success: bool,
@@ -343,7 +367,11 @@ pub fn sign_1559(tx: &Tx1559, secret: &[u8; 32]) -> anyhow::Result<String> {
     use sha3::{Digest, Keccak256};
 
     // Empty to = contract deployment (rlp empty string 0x80).
-    let to = if tx.to.is_empty() { Vec::new() } else { decode_address(&tx.to)? };
+    let to = if tx.to.is_empty() {
+        Vec::new()
+    } else {
+        decode_address(&tx.to)?
+    };
 
     let mut unsigned = rlp::RlpStream::new_list(9);
     append_u(&mut unsigned, tx.chain_id);
@@ -400,7 +428,11 @@ impl SwapClient {
     ) -> anyhow::Result<(String, bool)> {
         let actual = self.rpc.chain_id(chain).await?;
         if actual != chain.chain_id {
-            anyhow::bail!("RPC chain id mismatch: expected {}, got {}", chain.chain_id, actual);
+            anyhow::bail!(
+                "RPC chain id mismatch: expected {}, got {}",
+                chain.chain_id,
+                actual
+            );
         }
         let raw = sign_1559(tx, secret)?;
         let signer = crate::crypto::derive_address(secret).unwrap_or_default();
@@ -531,7 +563,9 @@ impl SwapClient {
         if current >= needed_wei {
             return Ok(None);
         }
-        let hash = self.approve(chain, token, spender, needed_wei, owner, secret).await?;
+        let hash = self
+            .approve(chain, token, spender, needed_wei, owner, secret)
+            .await?;
         Ok(Some(hash))
     }
 
@@ -545,7 +579,8 @@ impl SwapClient {
         owner: &str,
         secret: &[u8; 32],
     ) -> anyhow::Result<(String, bool, Option<String>)> {
-        let approval = if let (Some(token), Some(target)) = (approve_token, &quote.allowance_target) {
+        let approval = if let (Some(token), Some(target)) = (approve_token, &quote.allowance_target)
+        {
             self.ensure_allowance(chain, token, target, quote.sell_amount, owner, secret)
                 .await?
         } else {
@@ -562,7 +597,13 @@ impl SwapClient {
             quote.gas as u128
         } else {
             self.rpc
-                .estimate_gas(chain, owner, &quote.to, &format!("0x{:x}", quote.value), &data_hex)
+                .estimate_gas(
+                    chain,
+                    owner,
+                    &quote.to,
+                    &format!("0x{:x}", quote.value),
+                    &data_hex,
+                )
                 .await
                 .unwrap_or(300_000)
         };
@@ -579,7 +620,6 @@ impl SwapClient {
         let (hash, ok) = self.broadcast(chain, &tx, secret).await?;
         Ok((hash, ok, approval))
     }
-
 
     // -----------------------------------------------------------------------
     // Gas-fee sponsorship (EIP-7702 delegation)
@@ -691,7 +731,9 @@ impl SwapClient {
             data,
         };
         let raw = sign_1559(&tx, sponsor_secret)?;
-        let (hash, ok) = self.send_and_wait_signed(chain, sponsor_address, &raw).await?;
+        let (hash, ok) = self
+            .send_and_wait_signed(chain, sponsor_address, &raw)
+            .await?;
         if !ok {
             anyhow::bail!("sponsor account deploy reverted: {hash}");
         }
@@ -733,7 +775,8 @@ impl SwapClient {
             data: call,
         };
         let raw = sign_1559(&tx, sponsor_secret)?;
-        self.send_and_wait_signed(chain, sponsor_address, &raw).await
+        self.send_and_wait_signed(chain, sponsor_address, &raw)
+            .await
     }
     /// Live buy: spend `amount_native_wei` of the chain's native coin for a token.
     pub async fn buy_native(
@@ -749,7 +792,9 @@ impl SwapClient {
         let quote = self
             .quote(chain, NATIVE, token_address, amount_native_wei, taker, bps)
             .await?;
-        let (hash, ok, _) = self.execute_swap(chain, &quote, None, taker, secret).await?;
+        let (hash, ok, _) = self
+            .execute_swap(chain, &quote, None, taker, secret)
+            .await?;
         Ok(LiveTradeResult {
             tx_hash: hash.clone(),
             success: ok,
@@ -868,10 +913,11 @@ mod tests {
             data: vec![],
         };
         // Known private key (ethers.js test fixture)
-        let secret: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
-            .unwrap()
-            .try_into()
-            .unwrap();
+        let secret: [u8; 32] =
+            hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap()
+                .try_into()
+                .unwrap();
         let raw = sign_1559(&tx, &secret).unwrap();
         // Golden vector generated with ethers.js v6 (independent implementation):
         // Wallet(0x00...01).signTransaction(specExample)
@@ -890,7 +936,6 @@ pub fn decode_address(addr: &str) -> anyhow::Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-
 
 #[cfg(test)]
 mod nonce_tests {

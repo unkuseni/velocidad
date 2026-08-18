@@ -88,9 +88,14 @@ pub static CHAINS: &[Chain] = &[
         default_erc20s: &[],
     },
     chain!(
-        "ethereum", 1, "Ethereum", "ETH",
+        "ethereum",
+        1,
+        "Ethereum",
+        "ETH",
         "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
-        "https://etherscan.io", "ethereum", 3500.0,
+        "https://etherscan.io",
+        "ethereum",
+        3500.0,
         &[
             "https://ethereum-rpc.publicnode.com",
             "https://eth.llamarpc.com",
@@ -102,9 +107,14 @@ pub static CHAINS: &[Chain] = &[
         ]
     ),
     chain!(
-        "bsc", 56, "BNB Smart Chain", "BNB",
+        "bsc",
+        56,
+        "BNB Smart Chain",
+        "BNB",
         "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", // WBNB
-        "https://bscscan.com", "bsc", 600.0,
+        "https://bscscan.com",
+        "bsc",
+        600.0,
         &[
             "https://bsc-dataseed.binance.org",
             "https://bsc-dataseed1.binance.org",
@@ -116,9 +126,14 @@ pub static CHAINS: &[Chain] = &[
         ]
     ),
     chain!(
-        "polygon", 137, "Polygon", "POL",
+        "polygon",
+        137,
+        "Polygon",
+        "POL",
         "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", // WMATIC
-        "https://polygonscan.com", "polygon", 0.5,
+        "https://polygonscan.com",
+        "polygon",
+        0.5,
         &[
             "https://polygon-rpc.com",
             "https://polygon-bor-rpc.publicnode.com",
@@ -129,9 +144,14 @@ pub static CHAINS: &[Chain] = &[
         ]
     ),
     chain!(
-        "arbitrum", 42161, "Arbitrum One", "ETH",
+        "arbitrum",
+        42161,
+        "Arbitrum One",
+        "ETH",
         "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1", // WETH
-        "https://arbiscan.io", "arbitrum", 3500.0,
+        "https://arbiscan.io",
+        "arbitrum",
+        3500.0,
         &[
             "https://arb1.arbitrum.io/rpc",
             "https://arbitrum-one-rpc.publicnode.com",
@@ -142,9 +162,14 @@ pub static CHAINS: &[Chain] = &[
         ]
     ),
     chain!(
-        "optimism", 10, "Optimism", "ETH",
+        "optimism",
+        10,
+        "Optimism",
+        "ETH",
         "0x4200000000000000000000000000000000000006", // WETH
-        "https://optimistic.etherscan.io", "optimism", 3500.0,
+        "https://optimistic.etherscan.io",
+        "optimism",
+        3500.0,
         &[
             "https://mainnet.optimism.io",
             "https://optimism-rpc.publicnode.com",
@@ -155,21 +180,29 @@ pub static CHAINS: &[Chain] = &[
         ]
     ),
     chain!(
-        "base", 8453, "Base", "ETH",
+        "base",
+        8453,
+        "Base",
+        "ETH",
         "0x4200000000000000000000000000000000000006", // WETH
-        "https://basescan.org", "base", 3500.0,
+        "https://basescan.org",
+        "base",
+        3500.0,
         &[
             "https://mainnet.base.org",
             "https://base-rpc.publicnode.com",
         ],
-        &[
-            ("USDC", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
-        ]
+        &[("USDC", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),]
     ),
     chain!(
-        "avalanche", 43114, "Avalanche C-Chain", "AVAX",
+        "avalanche",
+        43114,
+        "Avalanche C-Chain",
+        "AVAX",
         "0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7", // WAVAX
-        "https://snowtrace.io", "avalanche", 35.0,
+        "https://snowtrace.io",
+        "avalanche",
+        35.0,
         &[
             "https://api.avax.network/ext/bc/C/rpc",
             "https://avalanche-c-chain-rpc.publicnode.com",
@@ -180,56 +213,70 @@ pub static CHAINS: &[Chain] = &[
         ]
     ),
     chain!(
-        "fantom", 250, "Fantom", "FTM",
+        "fantom",
+        250,
+        "Fantom",
+        "FTM",
         "0x21be370D5312f44cB42ce377BC9b8a0cEF1A4C83", // WFTM
-        "https://ftmscan.com", "fantom", 0.6,
-        &[
-            "https://rpc.ftm.tools",
-            "https://fantom-rpc.publicnode.com",
-        ],
+        "https://ftmscan.com",
+        "fantom",
+        0.6,
+        &["https://rpc.ftm.tools", "https://fantom-rpc.publicnode.com",],
         &[
             ("USDC", "0x04068DA6C83AFCFA0e13ba15A6696662335D5B75"),
             ("USDT", "0x049d68029688eAbF473097a2fC38ef61633A5567"),
         ]
     ),
     chain!(
-        "linea", 59144, "Linea", "ETH",
+        "linea",
+        59144,
+        "Linea",
+        "ETH",
         "0xe5D7C2a44FfDDf6b295A15c148167daaAf5Cf34f", // WETH
-        "https://lineascan.build", "linea", 3500.0,
+        "https://lineascan.build",
+        "linea",
+        3500.0,
         &["https://rpc.linea.build"],
-        &[
-            ("USDC", "0x176211869cA2b568f2A7D4EE941E073a821EE1ff"),
-        ]
+        &[("USDC", "0x176211869cA2b568f2A7D4EE941E073a821EE1ff"),]
     ),
     chain!(
-        "blast", 81457, "Blast", "ETH",
+        "blast",
+        81457,
+        "Blast",
+        "ETH",
         "0x4300000000000000000000000000000000000004", // WETH
-        "https://blastscan.io", "blast", 3500.0,
+        "https://blastscan.io",
+        "blast",
+        3500.0,
         &["https://rpc.blast.io"],
-        &[
-            ("USDB", "0x4300000000000000000000000000000000000003"),
-        ]
+        &[("USDB", "0x4300000000000000000000000000000000000003"),]
     ),
     chain!(
-        "scroll", 534352, "Scroll", "ETH",
+        "scroll",
+        534352,
+        "Scroll",
+        "ETH",
         "0x5300000000000000000000000000000000000004", // WETH
-        "https://scrollscan.com", "scroll", 3500.0,
+        "https://scrollscan.com",
+        "scroll",
+        3500.0,
         &["https://rpc.scroll.io"],
-        &[
-            ("USDC", "0x06eFdBFf2a14a7c8E15944D1F4A48F9F95F663A4"),
-        ]
+        &[("USDC", "0x06eFdBFf2a14a7c8E15944D1F4A48F9F95F663A4"),]
     ),
     chain!(
-        "gnosis", 100, "Gnosis", "xDAI",
+        "gnosis",
+        100,
+        "Gnosis",
+        "xDAI",
         "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d", // WXDAI
-        "https://gnosisscan.io", "gnosis", 1.0,
+        "https://gnosisscan.io",
+        "gnosis",
+        1.0,
         &[
             "https://rpc.gnosischain.com",
             "https://gnosis-rpc.publicnode.com",
         ],
-        &[
-            ("USDC", "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"),
-        ]
+        &[("USDC", "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"),]
     ),
 ];
 
@@ -241,9 +288,7 @@ impl Chain {
         let cleaned = input.trim().trim_start_matches("chain:").trim();
         let lower = cleaned.to_ascii_lowercase();
         CHAINS.iter().find(|c| {
-            c.id == lower
-                || c.chain_id.to_string() == lower
-                || alias_matches(c.id, &lower)
+            c.id == lower || c.chain_id.to_string() == lower || alias_matches(c.id, &lower)
         })
     }
 
@@ -278,7 +323,10 @@ impl Chain {
 
     /// Human-friendly summary line, e.g. `ethereum · Ethereum (1) · ETH`.
     pub fn display(&self) -> String {
-        format!("{} · {} ({}) · {}", self.id, self.name, self.chain_id, self.native)
+        format!(
+            "{} · {} ({}) · {}",
+            self.id, self.name, self.chain_id, self.native
+        )
     }
 }
 
@@ -334,7 +382,9 @@ mod tests {
         assert_eq!(addr, "0xdeadbeef");
         // Non-hex addresses are accepted (Solana base58 mints) and validated
         // later by the risk manager per chain kind.
-        let (c, addr) = Chain::resolve_token_arg("sol:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", eth).unwrap();
+        let (c, addr) =
+            Chain::resolve_token_arg("sol:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", eth)
+                .unwrap();
         assert_eq!(c.id, "solana");
         assert!(addr.starts_with("EPj"));
         assert!(Chain::resolve_token_arg("nosuchchain:0xabc", eth).is_none());
@@ -345,10 +395,19 @@ mod tests {
         let mut seen_ids = std::collections::HashSet::new();
         let mut seen_slugs = std::collections::HashSet::new();
         for c in CHAINS {
-            assert!(seen_ids.insert(c.chain_id), "duplicate chain id {}", c.chain_id);
+            assert!(
+                seen_ids.insert(c.chain_id),
+                "duplicate chain id {}",
+                c.chain_id
+            );
             assert!(seen_slugs.insert(c.id), "duplicate id {}", c.id);
             if c.kind == ChainKind::Evm {
-                assert_eq!(c.wrapped_native.len(), 42, "bad wrapped native for {}", c.id);
+                assert_eq!(
+                    c.wrapped_native.len(),
+                    42,
+                    "bad wrapped native for {}",
+                    c.id
+                );
             }
             assert!(!c.rpc_urls.is_empty());
         }

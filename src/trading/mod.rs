@@ -63,7 +63,8 @@ impl TradingEngine {
         slippage: f64,
         side: &str,
     ) -> Result<TradeReceipt> {
-        self.risk.validate_trade(chain, token_address, amount_native, slippage)?;
+        self.risk
+            .validate_trade(chain, token_address, amount_native, slippage)?;
 
         let quote = self.market.quote(chain, token_address).await;
         let price = quote.price_native;
@@ -77,7 +78,16 @@ impl TradingEngine {
 
         let conn = db.conn();
         let tx = conn.transaction().await?;
-        repo::add_to_position(&tx, user_id, wallet_id, chain.id, token_address, quantity, price).await?;
+        repo::add_to_position(
+            &tx,
+            user_id,
+            wallet_id,
+            chain.id,
+            token_address,
+            quantity,
+            price,
+        )
+        .await?;
         let order_id = repo::insert_order(
             &tx,
             &repo::NewOrder {
@@ -96,10 +106,11 @@ impl TradingEngine {
             },
         )
         .await?;
-        let alerts_fired = repo::trigger_satisfied_alerts(&tx, user_id, token_address, price).await?;
+        let alerts_fired =
+            repo::trigger_satisfied_alerts(&tx, user_id, token_address, price).await?;
         tx.commit().await?;
 
-        self.receipt(&conn, order_id, token_address, Some(0.0), quote.source)
+        self.receipt(conn, order_id, token_address, Some(0.0), quote.source)
             .await
             .map(|mut r| {
                 r.alerts_fired = alerts_fired;
@@ -118,7 +129,8 @@ impl TradingEngine {
         quantity: f64,
         slippage: f64,
     ) -> Result<TradeReceipt> {
-        self.risk.validate_trade(chain, token_address, quantity, slippage)?;
+        self.risk
+            .validate_trade(chain, token_address, quantity, slippage)?;
         if quantity <= 0.0 {
             bail!("quantity must be positive");
         }
@@ -135,7 +147,8 @@ impl TradingEngine {
 
         let conn = db.conn();
         let tx = conn.transaction().await?;
-        let realized = repo::reduce_position(&tx, user_id, chain.id, token_address, quantity, price).await?;
+        let realized =
+            repo::reduce_position(&tx, user_id, chain.id, token_address, quantity, price).await?;
         let order_id = repo::insert_order(
             &tx,
             &repo::NewOrder {
@@ -154,10 +167,13 @@ impl TradingEngine {
             },
         )
         .await?;
-        let alerts_fired = repo::trigger_satisfied_alerts(&tx, user_id, token_address, price).await?;
+        let alerts_fired =
+            repo::trigger_satisfied_alerts(&tx, user_id, token_address, price).await?;
         tx.commit().await?;
 
-        let mut receipt = self.receipt(&conn, order_id, token_address, Some(realized), quote.source).await?;
+        let mut receipt = self
+            .receipt(conn, order_id, token_address, Some(realized), quote.source)
+            .await?;
         receipt.alerts_fired = alerts_fired;
         Ok(receipt)
     }
@@ -202,15 +218,9 @@ impl TradingEngine {
             .ok_or_else(|| anyhow::anyhow!("order not found after insert"))
     }
 
-
     /// Fill a pending limit order at the current market price (called by the
     /// limit-order matcher worker). Updates the original order row in place.
-    pub async fn fill_limit(
-        &self,
-        db: &Db,
-        chain: &Chain,
-        order: &Order,
-    ) -> Result<TradeReceipt> {
+    pub async fn fill_limit(&self, db: &Db, chain: &Chain, order: &Order) -> Result<TradeReceipt> {
         let quote = self.market.quote(chain, &order.token_address).await;
         let price = quote.price_native;
         if price <= 0.0 {
@@ -238,15 +248,22 @@ impl TradingEngine {
         )
         .await?;
         repo::execute_pending_order(&tx, order.id, quantity, price, "paper").await?;
-        let alerts_fired = repo::trigger_satisfied_alerts(&tx, order.user_id, &order.token_address, price).await?;
+        let alerts_fired =
+            repo::trigger_satisfied_alerts(&tx, order.user_id, &order.token_address, price).await?;
         tx.commit().await?;
 
-        self.receipt(&conn, order.id, &order.token_address, Some(0.0), quote.source)
-            .await
-            .map(|mut r| {
-                r.alerts_fired = alerts_fired;
-                r
-            })
+        self.receipt(
+            conn,
+            order.id,
+            &order.token_address,
+            Some(0.0),
+            quote.source,
+        )
+        .await
+        .map(|mut r| {
+            r.alerts_fired = alerts_fired;
+            r
+        })
     }
 
     /// Build a human/API-friendly receipt from a stored order row.
@@ -258,7 +275,9 @@ impl TradingEngine {
         realized_pnl: Option<f64>,
         price_source: &'static str,
     ) -> Result<TradeReceipt> {
-        let order = repo::get_order(conn, order_id).await?.context("order not found")?;
+        let order = repo::get_order(conn, order_id)
+            .await?
+            .context("order not found")?;
         let symbol = repo::get_token(conn, &order.network, token_address)
             .await?
             .and_then(|t| t.symbol)

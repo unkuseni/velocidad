@@ -11,18 +11,23 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use teloxide::dispatching::{Dispatcher, HandlerExt, UpdateFilterExt};
 use teloxide::prelude::*;
-use teloxide::types::{Message, ParseMode, Update};
+use teloxide::types::{ChatId, Message, ParseMode, Update};
 use teloxide::utils::command::BotCommands;
 
 use crate::app::AppState;
 use crate::chains::{self, Chain};
 use crate::crypto;
 use crate::db::repo;
+use crate::exec::{self, sponsor_account_for, wallet_for_chain, wallet_secret};
 use crate::market::{format_price, format_qty, format_usd, short_addr};
 use crate::security::TokenReport;
 
 #[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase", description = "Velocidad trading bot commands", parse_with = "split")]
+#[command(
+    rename_rule = "lowercase",
+    description = "Velocidad trading bot commands",
+    parse_with = "split"
+)]
 pub enum Command {
     #[command(description = "start the bot")]
     Start,
@@ -105,6 +110,14 @@ async fn dispatch_command(
     cmd: Command,
     state: Arc<AppState>,
 ) -> ResponseResult<()> {
+    if let Some(user) = msg.from.as_ref() {
+        if let Err(retry) = state.bot_rate.check(&format!("u{}", user.id.0)) {
+            let _ = bot
+                .send_message(msg.chat.id, format!("⏳ Slow down — try again in {retry}s"))
+                .await;
+            return Ok(());
+        }
+    }
     let reply = match cmd {
         Command::Start => cmd_start(&state, &msg).await,
         Command::Help => Ok(help_text().to_string()),
@@ -115,7 +128,9 @@ async fn dispatch_command(
         Command::Buy(token, amount) => cmd_buy(&state, &msg, &token, amount, "buy").await,
         Command::Sell(token, qty) => cmd_sell(&state, &msg, &token, &qty).await,
         Command::Snipe(token, amount) => cmd_buy(&state, &msg, &token, amount, "snipe").await,
-        Command::Limit(token, price, amount) => cmd_limit(&state, &msg, &token, price, amount).await,
+        Command::Limit(token, price, amount) => {
+            cmd_limit(&state, &msg, &token, price, amount).await
+        }
         Command::Price(token) => cmd_price(&state, &msg, &token).await,
         Command::Token(token) => cmd_token(&state, &msg, &token).await,
         Command::Scan(token) => cmd_scan(&state, &msg, &token).await,
@@ -146,15 +161,10 @@ async fn dispatch_command(
     };
 
     match reply {
-        Ok(text) => {
-            let _ = bot
-                .send_message(msg.chat.id, text)
-                .parse_mode(ParseMode::Html)
-                .await;
-        }
+        Ok(text) => send_reply(&bot, msg.chat.id, &text).await,
         Err(err) => {
             tracing::warn!(error = %err, "command failed");
-            let _ = bot.send_message(msg.chat.id, format!("❌ {}", esc(&err.to_string()))).await;
+            send_reply(&bot, msg.chat.id, &format!("❌ {}", esc(&err.to_string()))).await;
         }
     }
     Ok(())
@@ -170,7 +180,12 @@ fn rest_of_command(msg: &Message, command: &str) -> Option<String> {
     })
 }
 
-async fn unknown_message(bot: Bot, msg: Message, _state: Arc<AppState>) -> ResponseResult<()> {
+async fn unknown_message(bot: Bot, msg: Message, state: Arc<AppState>) -> ResponseResult<()> {
+    if let Some(user) = msg.from.as_ref() {
+        if state.bot_rate.check(&format!("u{}", user.id.0)).is_err() {
+            return Ok(());
+        }
+    }
     bot.send_message(msg.chat.id, help_text())
         .parse_mode(ParseMode::Html)
         .await?;
@@ -194,7 +209,11 @@ async fn cmd_start(state: &AppState, msg: &Message) -> Result<String> {
          👤 User: <code>{}</code>\n\
          👛 Wallet: <code>{}</code>\n\n\
          <b>Commands</b>\n{}",
-        if state.config.is_remote() { " · Turso" } else { "" },
+        if state.config.is_remote() {
+            " · Turso"
+        } else {
+            ""
+        },
         state.config.database_url,
         chain.display(),
         user_id,
@@ -294,7 +313,10 @@ async fn cmd_chain(state: &AppState, msg: &Message, arg: Option<String>) -> Resu
         Some(name) => {
             let chain = Chain::resolve(name).context("unknown chain — see /chains")?;
             repo::set_setting(state.db.conn(), user_id, "chain", chain.id).await?;
-            Ok(format!("⛓️ Default chain set to <b>{}</b>", chain.display()))
+            Ok(format!(
+                "⛓️ Default chain set to <b>{}</b>",
+                chain.display()
+            ))
         }
     }
 }
@@ -303,7 +325,10 @@ async fn cmd_chains(state: &AppState, msg: &Message) -> Result<String> {
     let _ = ensure_user(state, msg).await?;
     let mut s = String::from("⛓️ <b>Supported chains</b>\n\n");
     for c in chains::CHAINS {
-        s.push_str(&format!("<code>{}</code> — {} ({}) · {}\n", c.id, c.name, c.chain_id, c.native));
+        s.push_str(&format!(
+            "<code>{}</code> — {} ({}) · {}\n",
+            c.id, c.name, c.chain_id, c.native
+        ));
     }
     s.push_str("\nUse <code>chain:0x…</code> in any token command to override your default.");
     Ok(s)
@@ -318,36 +343,45 @@ async fn cmd_balance(state: &AppState, msg: &Message, arg: Option<String>) -> Re
 
     // Optional <wallet-id> argument to pick a specific wallet.
     let wallet = if let Some(id_str) = arg.as_deref().and_then(|a| a.parse::<i64>().ok()) {
-        wallets.iter().find(|w| w.id == id_str).context("wallet id not found")?
+        wallets
+            .iter()
+            .find(|w| w.id == id_str)
+            .context("wallet id not found")?
     } else if chain.kind == crate::chains::ChainKind::Solana {
-        wallets.iter().find(|w| w.network == "solana").unwrap_or(&wallets[0])
+        wallets
+            .iter()
+            .find(|w| w.network == "solana")
+            .unwrap_or(&wallets[0])
     } else {
-        wallets.iter().find(|w| w.network != "solana").unwrap_or(&wallets[0])
+        wallets
+            .iter()
+            .find(|w| w.network != "solana")
+            .unwrap_or(&wallets[0])
     };
 
     let native_usd = state.market.native_price_usd(chain).await;
-    let mut s = format!(
-        "💰 <b>Balances</b> — {} · {}\n\n",
-        chain.name,
-        chain.native
-    );
+    let mut s = format!("💰 <b>Balances</b> — {} · {}\n\n", chain.name, chain.native);
 
     // On-chain native balance.
     let native_bal: Option<f64> = match chain.kind {
-        crate::chains::ChainKind::Evm => match state.rpc.native_balance(chain, &wallet.address).await {
-            Ok(wei) => Some(wei as f64 / 1e18),
-            Err(e) => {
-                s.push_str(&format!("⚠️ native balance unavailable: {e}\n"));
-                None
+        crate::chains::ChainKind::Evm => {
+            match state.rpc.native_balance(chain, &wallet.address).await {
+                Ok(wei) => Some(wei as f64 / 1e18),
+                Err(e) => {
+                    s.push_str(&format!("⚠️ native balance unavailable: {e}\n"));
+                    None
+                }
             }
-        },
-        crate::chains::ChainKind::Solana => match state.solana.balance(chain, &wallet.address).await {
-            Ok(lamports) => Some(lamports as f64 / 1e9),
-            Err(e) => {
-                s.push_str(&format!("⚠️ SOL balance unavailable: {e}\n"));
-                None
+        }
+        crate::chains::ChainKind::Solana => {
+            match state.solana.balance(chain, &wallet.address).await {
+                Ok(lamports) => Some(lamports as f64 / 1e9),
+                Err(e) => {
+                    s.push_str(&format!("⚠️ SOL balance unavailable: {e}\n"));
+                    None
+                }
             }
-        },
+        }
     };
     if let Some(bal) = native_bal {
         s.push_str(&format!(
@@ -370,22 +404,24 @@ async fn cmd_balance(state: &AppState, msg: &Message, arg: Option<String>) -> Re
             }
             items.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
             for (symbol, amount, usd) in items.iter().take(6) {
-                s.push_str(&format!("🪙 {:.4} <b>{}</b> · <b>{}</b>\n", amount, symbol, format_usd(*usd)));
+                s.push_str(&format!(
+                    "🪙 {:.4} <b>{}</b> · <b>{}</b>\n",
+                    amount,
+                    symbol,
+                    format_usd(*usd)
+                ));
             }
         }
     }
 
     // Curated ERC20 balances.
     for (symbol, addr) in chain.default_erc20s {
-        match state.rpc.erc20_balance(chain, addr, &wallet.address).await {
-            Ok(raw) => {
-                let decimals = state.rpc.erc20_decimals(chain, addr).await;
-                let bal = raw as f64 / 10f64.powi(decimals as i32);
-                if bal > 0.0 {
-                    s.push_str(&format!("🪙 {:.4} <b>{symbol}</b>\n", bal));
-                }
+        if let Ok(raw) = state.rpc.erc20_balance(chain, addr, &wallet.address).await {
+            let decimals = state.rpc.erc20_decimals(chain, addr).await;
+            let bal = raw as f64 / 10f64.powi(decimals as i32);
+            if bal > 0.0 {
+                s.push_str(&format!("🪙 {:.4} <b>{symbol}</b>\n", bal));
             }
-            Err(_) => {},
         }
     }
 
@@ -417,7 +453,10 @@ async fn cmd_balance(state: &AppState, msg: &Message, arg: Option<String>) -> Re
     } else {
         "paper (no 0x key)".to_string()
     };
-    s.push_str(&format!("\n⚙️ Mode: <b>{mode}</b> · Wallet: <code>{}</code>", wallet.address));
+    s.push_str(&format!(
+        "\n⚙️ Mode: <b>{mode}</b> · Wallet: <code>{}</code>",
+        wallet.address
+    ));
     Ok(s)
 }
 // ---------------------------------------------------------------------------
@@ -441,145 +480,70 @@ async fn cmd_buy(
     if side == "snipe" {
         let report = state.scanner.scan(&state.db, chain, &token).await;
         if report.is_honeypot {
-            bail!("🚫 <code>{}</code> is flagged as a honeypot — snipe blocked", short_addr(&token));
+            bail!(
+                "🚫 <code>{}</code> is flagged as a honeypot — snipe blocked",
+                short_addr(&token)
+            );
         }
     }
 
-    // Paper trading fills at live prices on every chain kind.
-    if state.config.paper_trading || (chain.kind == crate::chains::ChainKind::Evm && !state.swap.enabled()) {
-        let receipt = state
-            .engine
-            .buy(
-                &state.db,
-                chain,
-                user_id,
-                Some(wallet.id),
-                &token,
-                amount,
-                slippage,
-                side,
-            )
-            .await?;
-        return Ok(fmt_buy_paper(&receipt, chain, side));
-    }
-
-    match chain.kind {
-        crate::chains::ChainKind::Solana => {
-            // Live Solana swap via Jupiter (keyless).
-            let secret = wallet_secret(state, &wallet)?;
-            let sponsor = if user_sponsorship(state, user_id, chain).await? { state.solana.sponsor.as_ref() } else { None };
-            let res = state.solana.buy(chain, &token, amount, slippage, &wallet.address, &secret, sponsor).await?;
-            if !res.success {
-                bail!("swap failed — tx {}", res.tx_signature);
-            }
-            let decimals = state.solana.token_decimals(chain, &token).await.unwrap_or(9);
-            let qty = res.token_amount as f64 / 10f64.powi(decimals as i32);
-            let price = res.price_native;
-            record_live_order(state, user_id, Some(wallet.id), chain, &token, side, amount, qty, price, slippage, &res.tx_signature).await?;
-            Ok(format!(
-                "{} <b>{}</b> filled <b>LIVE</b> 🔗 <a href=\"{}\" >{}</a>\n\n\
-                 Chain: <b>solana</b>\n\
-                 Token: <code>{}</code> ({})\n\
-                 Qty: <b>{}</b>\n\
-                 Price: <b>{}</b>\n\
-                 Spent: <b>{:.9} SOL</b>\n\
-                 Slippage: {:.2}%",
-                if side == "snipe" { "🛰️" } else { "✅" },
-                side.to_uppercase(),
-                res.explorer_link,
-                &res.tx_signature[..res.tx_signature.len().min(10)],
-                short_addr(&token),
-                token_symbol(state, chain, &token).await,
-                format_qty(qty),
-                format_price(price),
-                amount,
-                slippage * 100.0
-            ))
-        }
-        crate::chains::ChainKind::Evm => {
-            // Live EVM swap via 0x — either self-paid or gas-sponsored.
-            let secret = wallet_secret(state, &wallet)?;
-            let amount_wei = (amount * 1e18) as u128;
-            if amount_wei == 0 {
-                bail!("amount too small for a live swap");
-            }
-            let sponsored = user_sponsorship(state, user_id, chain).await?;
-            let res = if sponsored {
-                let account = sponsor_account_for(state, chain).await?;
-                if account.is_empty() {
-                    bail!("sponsorship ON but no SponsorAccount on {} — run /sponsor setup", chain.id);
-                }
-                let target = state.rpc.delegation_of(chain, &wallet.address).await?;
-                if target.as_deref() != Some(account.as_str()) {
-                    bail!("EOA is not delegated to the sponsor account — run /sponsor on");
-                }
-                let (sponsor_addr, sponsor_secret) = state.swap.sponsor.as_ref().context("sponsor not configured")?;
-                let quote = state
-                    .swap
-                    .quote(chain, crate::swap::NATIVE, &token, amount_wei, &wallet.address, (slippage * 10_000.0) as u64)
-                    .await?;
-                let swap_data = hex::decode(quote.data.trim_start_matches("0x"))?;
-                let (hash, ok) = state
-                    .swap
-                    .sponsored_execute(
-                        chain,
-                        &wallet.address,
-                        sponsor_addr,
-                        sponsor_secret,
-                        &quote.to,
-                        quote.value,
-                        &swap_data,
-                        (quote.gas as f64 * 2.0) as u64,
-                    )
-                    .await?;
-                if !ok {
-                    bail!("sponsored swap reverted — tx {hash}");
-                }
-                crate::swap::LiveTradeResult {
-                    tx_hash: hash.clone(),
-                    success: true,
-                    token_amount: quote.buy_amount,
-                    native_amount: quote.sell_amount,
-                    price_native: quote.price_native,
-                    approval_tx: None,
-                    explorer_link: chain.explorer_link(&hash),
-                }
+    let outcome = exec::buy(
+        state, chain, user_id, &wallet, &token, amount, slippage, side,
+    )
+    .await?;
+    Ok(match outcome {
+        exec::TradeOutcome::Paper(receipt) => fmt_buy_paper(&receipt, chain, side),
+        exec::TradeOutcome::SolanaLive(o) => format!(
+            "{} <b>{}</b> filled <b>LIVE</b> 🔗 <a href=\"{}\" >{}</a>\n\n\
+             Chain: <b>solana</b>\n\
+             Token: <code>{}</code> ({})\n\
+             Qty: <b>{}</b>\n\
+             Price: <b>{}</b>\n\
+             Spent: <b>{:.9} SOL</b>\n\
+             Slippage: {:.2}%{}",
+            if side == "snipe" { "🛰️" } else { "✅" },
+            side.to_uppercase(),
+            o.result.explorer_link,
+            &o.result.tx_signature[..o.result.tx_signature.len().min(10)],
+            short_addr(&token),
+            token_symbol(state, chain, &token).await,
+            format_qty(o.qty),
+            format_price(o.price),
+            amount,
+            slippage * 100.0,
+            if o.sponsored {
+                "\n⛽ gas sponsored"
             } else {
-                state
-                    .swap
-                    .buy_native(chain, &token, amount_wei, slippage, &wallet.address, &secret)
-                    .await?
-            };
-            if !res.success {
-                bail!("swap reverted — tx {}", res.tx_hash);
+                ""
             }
-            let decimals = state.rpc.erc20_decimals(chain, &token).await;
-            let qty = res.token_amount as f64 / 10f64.powi(decimals as i32);
-            let price = res.price_native;
-            record_live_order(state, user_id, Some(wallet.id), chain, &token, side, amount, qty, price, slippage, &res.tx_hash).await?;
-            Ok(format!(
-                "{} <b>{}</b> filled <b>LIVE</b> 🔗 <a href=\"{}\" >{}</a>\n\n\
-                 Chain: <b>{}</b>\n\
-                 Token: <code>{}</code> ({})\n\
-                 Qty: <b>{}</b>\n\
-                 Price: <b>{}</b>\n\
-                 Spent: <b>{:.6} {}</b>\n\
-                 Slippage: {:.2}%",
-                if side == "snipe" { "🛰️" } else { "✅" },
-                side.to_uppercase(),
-                res.explorer_link,
-                &res.tx_hash[..res.tx_hash.len().min(10)],
-                chain.id,
-                short_addr(&token),
-                token_symbol(state, chain, &token).await,
-                format_qty(qty),
-                format_price(price),
-                amount,
-                chain.native,
-                slippage * 100.0
-            ))
-        }
-    }
+        ),
+        exec::TradeOutcome::EvmLive(o) => format!(
+            "{} <b>{}</b> filled <b>LIVE</b> 🔗 <a href=\"{}\" >{}</a>\n\n\
+             Chain: <b>{}</b>\n\
+             Token: <code>{}</code> ({})\n\
+             Qty: <b>{}</b>\n\
+             Price: <b>{}</b>\n\
+             Spent: <b>{:.6} {}</b>\n\
+             Slippage: {:.2}%{}",
+            if side == "snipe" { "🛰️" } else { "✅" },
+            side.to_uppercase(),
+            o.result.explorer_link,
+            &o.result.tx_hash[..o.result.tx_hash.len().min(10)],
+            chain.id,
+            short_addr(&token),
+            token_symbol(state, chain, &token).await,
+            format_qty(o.qty),
+            format_price(o.price),
+            amount,
+            chain.native,
+            slippage * 100.0,
+            if o.sponsored {
+                "\n⛽ gas sponsored"
+            } else {
+                ""
+            }
+        ),
+    })
 }
 
 async fn cmd_sell(
@@ -601,19 +565,27 @@ async fn cmd_sell(
         if live {
             match chain.kind {
                 crate::chains::ChainKind::Evm => {
-                    let raw = state.rpc.erc20_balance(chain, &token, &wallet.address).await?;
+                    let raw = state
+                        .rpc
+                        .erc20_balance(chain, &token, &wallet.address)
+                        .await?;
                     let decimals = state.rpc.erc20_decimals(chain, &token).await;
                     raw as f64 / 10f64.powi(decimals as i32)
                 }
                 crate::chains::ChainKind::Solana => {
                     let balances = state.solana.spl_balances(chain, &wallet.address).await?;
-                    let b = balances.iter().find(|b| b.mint.eq_ignore_ascii_case(&token))
+                    let b = balances
+                        .iter()
+                        .find(|b| b.mint.eq_ignore_ascii_case(&token))
                         .context("no on-chain balance for this token")?;
                     b.amount
                 }
             }
         } else {
-            position.as_ref().context("no open position for this token")?.quantity
+            position
+                .as_ref()
+                .context("no open position for this token")?
+                .quantity
         }
     } else {
         qty_arg
@@ -624,147 +596,52 @@ async fn cmd_sell(
         bail!("quantity must be positive");
     }
 
-    if !live || (chain.kind == crate::chains::ChainKind::Evm && !state.swap.enabled()) {
-        let receipt = state
-            .engine
-            .sell(
-                &state.db,
-                chain,
-                user_id,
-                Some(wallet.id),
-                &token,
-                qty,
-                slippage,
-            )
-            .await?;
-        return Ok(fmt_sell_paper(&receipt, chain));
-    }
-
-    match chain.kind {
-        crate::chains::ChainKind::Solana => {
-            let secret = wallet_secret(state, &wallet)?;
-            let sponsor = if user_sponsorship(state, user_id, chain).await? { state.solana.sponsor.as_ref() } else { None };
-            let res = state.solana.sell(chain, &token, qty, slippage, &wallet.address, &secret, sponsor).await?;
-            if !res.success {
-                bail!("swap failed — tx {}", res.tx_signature);
-            }
-            let proceeds = res.native_amount as f64 / 1e9;
-            let price = res.price_native;
-            record_live_order(state, user_id, Some(wallet.id), chain, &token, "sell", qty, proceeds, price, slippage, &res.tx_signature).await?;
-            Ok(format!(
-                "💸 <b>SELL</b> filled <b>LIVE</b> 🔗 <a href=\"{}\" >{}</a>\n\n\
-                 Chain: <b>solana</b>\n\
-                 Token: <code>{}</code> ({})\n\
-                 Qty: <b>{}</b>\n\
-                 Price: <b>{}</b>\n\
-                 Proceeds: <b>{:.9} SOL</b>{}",
-                res.explorer_link,
-                &res.tx_signature[..res.tx_signature.len().min(10)],
-                short_addr(&token),
-                token_symbol(state, chain, &token).await,
-                format_qty(qty),
-                format_price(price),
-                proceeds,
-                "",
-            ))
-        }
-        crate::chains::ChainKind::Evm => {
-            let secret = wallet_secret(state, &wallet)?;
-            let sponsored = user_sponsorship(state, user_id, chain).await?;
-            let res = if sponsored {
-                let account = sponsor_account_for(state, chain).await?;
-                if account.is_empty() {
-                    bail!("sponsorship ON but no SponsorAccount on {} — run /sponsor setup", chain.id);
-                }
-                let target = state.rpc.delegation_of(chain, &wallet.address).await?;
-                if target.as_deref() != Some(account.as_str()) {
-                    bail!("EOA is not delegated to the sponsor account — run /sponsor on");
-                }
-                let (sponsor_addr, sponsor_secret) = state.swap.sponsor.as_ref().context("sponsor not configured")?;
-                let decimals = state.rpc.erc20_decimals(chain, &token).await;
-                let amount_wei = (qty * 10f64.powi(decimals as i32)) as u128;
-                let quote = state
-                    .swap
-                    .quote(chain, &token, crate::swap::NATIVE, amount_wei, &wallet.address, (slippage * 10_000.0) as u64)
-                    .await?;
-                // Sponsored approval when the swap needs an allowance.
-                let mut approval_tx: Option<String> = None;
-                if let Some(spender) = &quote.allowance_target {
-                    let current = state.rpc.erc20_allowance(chain, &token, &wallet.address, spender).await.unwrap_or(0);
-                    if current < amount_wei {
-                        let approve_data = crate::swap::SwapClient::approve_calldata(spender, amount_wei)?;
-                        let (ahash, aok) = state
-                            .swap
-                            .sponsored_execute(chain, &wallet.address, sponsor_addr, sponsor_secret, &token, 0, &approve_data, 150_000)
-                            .await?;
-                        if !aok {
-                            bail!("sponsored approval reverted — tx {ahash}");
-                        }
-                        approval_tx = Some(ahash);
-                    }
-                }
-                let swap_data = hex::decode(quote.data.trim_start_matches("0x"))?;
-                let (hash, ok) = state
-                    .swap
-                    .sponsored_execute(
-                        chain,
-                        &wallet.address,
-                        sponsor_addr,
-                        sponsor_secret,
-                        &quote.to,
-                        quote.value,
-                        &swap_data,
-                        (quote.gas as f64 * 2.0) as u64,
-                    )
-                    .await?;
-                if !ok {
-                    bail!("sponsored swap reverted — tx {hash}");
-                }
-                crate::swap::LiveTradeResult {
-                    tx_hash: hash.clone(),
-                    success: true,
-                    token_amount: quote.sell_amount,
-                    native_amount: quote.buy_amount,
-                    price_native: 1.0 / quote.price_native.max(1e-18),
-                    approval_tx,
-                    explorer_link: chain.explorer_link(&hash),
-                }
+    let outcome = exec::sell(state, chain, user_id, &wallet, &token, qty, slippage).await?;
+    Ok(match outcome {
+        exec::TradeOutcome::Paper(receipt) => fmt_sell_paper(&receipt, chain),
+        exec::TradeOutcome::SolanaLive(o) => format!(
+            "💸 <b>SELL</b> filled <b>LIVE</b> 🔗 <a href=\"{}\" >{}</a>\n\n\
+             Chain: <b>solana</b>\n\
+             Token: <code>{}</code> ({})\n\
+             Qty: <b>{}</b>\n\
+             Price: <b>{}</b>\n\
+             Proceeds: <b>{:.9} SOL</b>{}",
+            o.result.explorer_link,
+            &o.result.tx_signature[..o.result.tx_signature.len().min(10)],
+            short_addr(&token),
+            token_symbol(state, chain, &token).await,
+            format_qty(o.qty),
+            format_price(o.price),
+            o.result.native_amount as f64 / 1e9,
+            if o.sponsored {
+                "\n⛽ gas sponsored"
             } else {
-                state
-                    .swap
-                    .sell_tokens(chain, &token, qty, slippage, &wallet.address, &secret)
-                    .await?
-            };
-            if !res.success {
-                bail!("swap reverted — tx {}", res.tx_hash);
+                ""
             }
-            let proceeds = res.native_amount as f64 / 1e18;
-            let price = res.price_native;
-            // record_live_order keeps paper accounting in sync (reduces when a position exists).
-            record_live_order(state, user_id, Some(wallet.id), chain, &token, "sell", qty, proceeds, price, slippage, &res.tx_hash).await?;
-            Ok(format!(
-                "💸 <b>SELL</b> filled <b>LIVE</b> 🔗 <a href=\"{}\" >{}</a>\n\n\
-                 Chain: <b>{}</b>\n\
-                 Token: <code>{}</code> ({})\n\
-                 Qty: <b>{}</b>\n\
-                 Price: <b>{}</b>\n\
-                 Proceeds: <b>{:.6} {}</b>{}",
-                res.explorer_link,
-                &res.tx_hash[..res.tx_hash.len().min(10)],
-                chain.id,
-                short_addr(&token),
-                token_symbol(state, chain, &token).await,
-                format_qty(qty),
-                format_price(price),
-                proceeds,
-                chain.native,
-                res.approval_tx
-                    .as_ref()
-                    .map(|h| format!("\n✅ allowance approved: <code>{}</code>", short_addr(h)))
-                    .unwrap_or_default(),
-            ))
-        }
-    }
+        ),
+        exec::TradeOutcome::EvmLive(o) => format!(
+            "💸 <b>SELL</b> filled <b>LIVE</b> 🔗 <a href=\"{}\" >{}</a>\n\n\
+             Chain: <b>{}</b>\n\
+             Token: <code>{}</code> ({})\n\
+             Qty: <b>{}</b>\n\
+             Price: <b>{}</b>\n\
+             Proceeds: <b>{:.6} {}</b>{}",
+            o.result.explorer_link,
+            &o.result.tx_hash[..o.result.tx_hash.len().min(10)],
+            chain.id,
+            short_addr(&token),
+            token_symbol(state, chain, &token).await,
+            format_qty(o.qty),
+            format_price(o.price),
+            o.result.native_amount as f64 / 1e18,
+            chain.native,
+            o.result
+                .approval_tx
+                .as_ref()
+                .map(|h| format!("\n✅ allowance approved: <code>{}</code>", short_addr(h)))
+                .unwrap_or_default(),
+        ),
+    })
 }
 
 async fn cmd_price(state: &AppState, msg: &Message, token_arg: &str) -> Result<String> {
@@ -800,12 +677,17 @@ async fn cmd_token(state: &AppState, msg: &Message, token_arg: &str) -> Result<S
     let chain = parse_token_arg(token_arg, state.user_chain(user_id).await)?;
     let (chain, token) = (chain.0, chain.1);
     let quote = state.market.quote(chain, &token).await;
-    let age = quote.pair_created_at
+    let age = quote
+        .pair_created_at
         .map(|t| {
             let secs = (chrono::Utc::now().timestamp() - t).max(0);
-            if secs < 3600 { format!("{}m", secs / 60) }
-            else if secs < 86400 { format!("{}h", secs / 3600) }
-            else { format!("{}d", secs / 86400) }
+            if secs < 3600 {
+                format!("{}m", secs / 60)
+            } else if secs < 86400 {
+                format!("{}h", secs / 3600)
+            } else {
+                format!("{}d", secs / 86400)
+            }
         })
         .unwrap_or_else(|| "—".to_string());
     let pair_link = quote
@@ -835,7 +717,7 @@ async fn cmd_token(state: &AppState, msg: &Message, token_arg: &str) -> Result<S
         quote.price_change_24h,
         quote.txns_buy_24h,
         quote.txns_sell_24h,
-        quote.fdv.map(|f| format_usd(f)).unwrap_or_else(|| "—".to_string()),
+        quote.fdv.map(format_usd).unwrap_or_else(|| "—".to_string()),
         quote.dex.clone().unwrap_or_default(),
         short_addr(quote.pair_address.as_deref().unwrap_or_default()),
         quote.source,
@@ -861,9 +743,13 @@ async fn cmd_scan(state: &AppState, msg: &Message, token_arg: &str) -> Result<St
         esc(&report.symbol),
         report.risk_score,
         risk_badge(report.risk_score),
-        if report.is_honeypot { "🚫 HONEYPOT" }
-        else if report.risk_score >= 70 { "⚠️ HIGH RISK" }
-        else { "✅ tradable" },
+        if report.is_honeypot {
+            "🚫 HONEYPOT"
+        } else if report.risk_score >= 70 {
+            "⚠️ HIGH RISK"
+        } else {
+            "✅ tradable"
+        },
         report.data_source,
         checks_text(&report)
     ))
@@ -873,11 +759,14 @@ async fn cmd_portfolio(state: &AppState, msg: &Message) -> Result<String> {
     let user_id = ensure_user(state, msg).await?;
     let positions = repo::list_positions(state.db.conn(), user_id).await?;
     if positions.is_empty() {
-        return Ok("📂 No open positions. Start with /buy &lt;token&gt; &lt;amount&gt;.".to_string());
+        return Ok(
+            "📂 No open positions. Start with /buy &lt;token&gt; &lt;amount&gt;.".to_string(),
+        );
     }
 
     // Group positions per network for a per-chain view.
-    let mut groups: std::collections::BTreeMap<String, Vec<&crate::db::models::Position>> = Default::default();
+    let mut groups: std::collections::BTreeMap<String, Vec<&crate::db::models::Position>> =
+        Default::default();
     for p in &positions {
         groups.entry(p.network.clone()).or_default().push(p);
     }
@@ -910,7 +799,10 @@ async fn cmd_portfolio(state: &AppState, msg: &Message) -> Result<String> {
         s.push_str(&format!("  Σ <b>{}</b>\n\n", format_usd(chain_usd)));
         grand_usd += chain_usd;
     }
-    s.push_str(&format!("💼 <b>Total portfolio: {}</b>", format_usd(grand_usd)));
+    s.push_str(&format!(
+        "💼 <b>Total portfolio: {}</b>",
+        format_usd(grand_usd)
+    ));
     Ok(s)
 }
 
@@ -952,7 +844,9 @@ async fn cmd_trending(state: &AppState, msg: &Message) -> Result<String> {
     let _ = ensure_user(state, msg).await?;
     let list = state.market.trending().await;
     if list.is_empty() {
-        return Ok("🔥 No trending data right now (offline or rate-limited). Try again later.".to_string());
+        return Ok(
+            "🔥 No trending data right now (offline or rate-limited). Try again later.".to_string(),
+        );
     }
     let mut s = String::from("🔥 <b>Trending tokens</b> (DexScreener profiles)\n\n");
     for t in list.iter().take(8) {
@@ -963,9 +857,7 @@ async fn cmd_trending(state: &AppState, msg: &Message) -> Result<String> {
             .unwrap_or_else(|| short_addr(&t.token_address));
         s.push_str(&format!(
             "<code>{}</code> <b>{}</b> — <code>{}</code>\n",
-            t.chain,
-            label,
-            t.token_address
+            t.chain, label, t.token_address
         ));
     }
     s.push_str("\nInspect any with /token &lt;chain:address&gt;");
@@ -976,13 +868,18 @@ async fn cmd_find(state: &AppState, msg: &Message, q: &str) -> Result<String> {
     let _ = ensure_user(state, msg).await?;
     let results = state.market.search(q).await;
     if results.is_empty() {
-        return Ok(format!("🔍 No results for <code>{}</code>. Try a ticker like /find pepe.", esc(q)));
+        return Ok(format!(
+            "🔍 No results for <code>{}</code>. Try a ticker like /find pepe.",
+            esc(q)
+        ));
     }
     let mut s = format!("🔍 <b>Search: {}</b>\n\n", esc(q));
     for r in results.iter().take(10) {
         s.push_str(&format!(
             "<b>{}</b> · {} · <code>{}</code>\n",
-            esc(&r.symbol), esc(&r.chain), r.address
+            esc(&r.symbol),
+            esc(&r.chain),
+            r.address
         ));
         s.push_str(&format!(
             "   {} · liq {} · vol {} · 24h <b>{:+.1}%</b>\n",
@@ -1020,7 +917,12 @@ async fn cmd_sponsor(state: &AppState, msg: &Message, arg: Option<String>) -> Re
     let chain = state.user_chain(user_id).await;
     let wallet = match wallet_for_chain(state, user_id, chain).await {
         Ok(w) => w,
-        Err(_) => return Ok("👛 Create a wallet first (EVM: /wallet new, Solana: /wallet new solana).".to_string()),
+        Err(_) => {
+            return Ok(
+                "👛 Create a wallet first (EVM: /wallet new, Solana: /wallet new solana)."
+                    .to_string(),
+            )
+        }
     };
     let secret = wallet_secret(state, &wallet)?;
 
@@ -1047,11 +949,16 @@ async fn sponsorship_on(
     match chain.kind {
         crate::chains::ChainKind::Evm => {
             let Some((sponsor_addr, _)) = state.swap.sponsor.as_ref() else {
-                return Ok("⚠️ No sponsor configured — the operator must set SPONSOR_KEY.".to_string());
+                return Ok(
+                    "⚠️ No sponsor configured — the operator must set SPONSOR_KEY.".to_string(),
+                );
             };
             let account = sponsor_account_for(state, chain).await?;
             if account.is_empty() {
-                return Ok("⚠️ No SponsorAccount deployed on this chain yet — run /sponsor setup first.".to_string());
+                return Ok(
+                    "⚠️ No SponsorAccount deployed on this chain yet — run /sponsor setup first."
+                        .to_string(),
+                );
             }
             // Already delegated?
             if let Ok(Some(target)) = state.rpc.delegation_of(chain, &wallet.address).await {
@@ -1063,7 +970,10 @@ async fn sponsorship_on(
                     short_addr(sponsor_addr)
                 ));
             }
-            let hash = state.swap.send_delegation(chain, &wallet.address, secret, &account).await?;
+            let hash = state
+                .swap
+                .send_delegation(chain, &wallet.address, secret, &account)
+                .await?;
             repo::set_setting(state.db.conn(), user_id, &setting_key, "on").await?;
             Ok(format!(
                 "🪪 <b>EIP-7702 delegation set</b> ({})\n\n\
@@ -1082,18 +992,43 @@ async fn sponsorship_on(
         }
         crate::chains::ChainKind::Solana => {
             let Some(sp) = state.solana.sponsor.as_ref() else {
-                return Ok("⚠️ No Solana sponsor configured — the operator must set SPONSOR_SOLANA_KEY.".to_string());
+                return Ok(
+                    "⚠️ No Solana sponsor configured — the operator must set SPONSOR_SOLANA_KEY."
+                        .to_string(),
+                );
             };
             let blockhash = state.solana.latest_blockhash(chain).await?;
-            let owner: [u8; 32] = bs58::decode(wallet.address.trim()).into_vec().context("bad wallet")?.try_into().map_err(|_| anyhow::anyhow!("bad pubkey"))?;
+            let owner: [u8; 32] = bs58::decode(wallet.address.trim())
+                .into_vec()
+                .context("bad wallet")?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("bad pubkey"))?;
             let balances = state.solana.spl_balances(chain, &wallet.address).await?;
             let mut txs: Vec<String> = Vec::new();
             for b in balances.iter().filter(|b| b.amount > 0.0) {
-                let account_bytes: [u8; 32] = bs58::decode(b.account.trim()).into_vec().ok().and_then(|v| v.try_into().ok()).context("bad token account")?;
+                let account_bytes: [u8; 32] = bs58::decode(b.account.trim())
+                    .into_vec()
+                    .ok()
+                    .and_then(|v| v.try_into().ok())
+                    .context("bad token account")?;
                 let raw_amount = (b.amount * 10f64.powi(b.decimals as i32)) as u64;
-                let (message, signers) = crate::solana::build_sponsored_approve(&owner, &account_bytes, &sp.pubkey, raw_amount, &sp.pubkey, &blockhash);
-                let sig = state.solana.send_sponsored(chain, &message, &signers, &[&sp.seed, secret]).await?;
-                txs.push(format!("  ✅ {} · <code>{}</code>", b.mint, short_addr(&sig)));
+                let (message, signers) = crate::solana::build_sponsored_approve(
+                    &owner,
+                    &account_bytes,
+                    &sp.pubkey,
+                    raw_amount,
+                    &sp.pubkey,
+                    &blockhash,
+                );
+                let sig = state
+                    .solana
+                    .send_sponsored(chain, &message, &signers, &[&sp.seed, secret])
+                    .await?;
+                txs.push(format!(
+                    "  ✅ {} · <code>{}</code>",
+                    b.mint,
+                    short_addr(&sig)
+                ));
             }
             if txs.is_empty() {
                 return Ok("🪐 No non-zero token balances to delegate. Fund the wallet first, then /sponsor on.".to_string());
@@ -1119,9 +1054,16 @@ async fn sponsorship_off(
     let setting_key = format!("sponsor:{}", chain.id);
     match chain.kind {
         crate::chains::ChainKind::Evm => {
-            let hash = state.swap.clear_delegation(chain, &wallet.address, secret).await?;
+            let hash = state
+                .swap
+                .clear_delegation(chain, &wallet.address, secret)
+                .await?;
             repo::set_setting(state.db.conn(), user_id, &setting_key, "off").await?;
-            Ok(format!("🪪 Delegation cleared ({}). 🔗 {}", chain.id, chain.explorer_link(&hash)))
+            Ok(format!(
+                "🪪 Delegation cleared ({}). 🔗 {}",
+                chain.id,
+                chain.explorer_link(&hash)
+            ))
         }
         crate::chains::ChainKind::Solana => {
             let Some(sp) = state.solana.sponsor.as_ref() else {
@@ -1129,14 +1071,34 @@ async fn sponsorship_off(
                 return Ok("🪐 Solana sponsorship OFF (no sponsor configured).".to_string());
             };
             let blockhash = state.solana.latest_blockhash(chain).await?;
-            let owner: [u8; 32] = bs58::decode(wallet.address.trim()).into_vec().context("bad wallet")?.try_into().map_err(|_| anyhow::anyhow!("bad pubkey"))?;
+            let owner: [u8; 32] = bs58::decode(wallet.address.trim())
+                .into_vec()
+                .context("bad wallet")?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("bad pubkey"))?;
             let balances = state.solana.spl_balances(chain, &wallet.address).await?;
             let mut txs: Vec<String> = Vec::new();
             for b in balances.iter().filter(|b| b.amount > 0.0) {
-                let account_bytes: [u8; 32] = bs58::decode(b.account.trim()).into_vec().ok().and_then(|v| v.try_into().ok()).context("bad token account")?;
-                let (message, signers) = crate::solana::build_sponsored_revoke(&owner, &account_bytes, &sp.pubkey, &blockhash);
-                let sig = state.solana.send_sponsored(chain, &message, &signers, &[&sp.seed, secret]).await?;
-                txs.push(format!("  ✅ revoked {} · <code>{}</code>", b.mint, short_addr(&sig)));
+                let account_bytes: [u8; 32] = bs58::decode(b.account.trim())
+                    .into_vec()
+                    .ok()
+                    .and_then(|v| v.try_into().ok())
+                    .context("bad token account")?;
+                let (message, signers) = crate::solana::build_sponsored_revoke(
+                    &owner,
+                    &account_bytes,
+                    &sp.pubkey,
+                    &blockhash,
+                );
+                let sig = state
+                    .solana
+                    .send_sponsored(chain, &message, &signers, &[&sp.seed, secret])
+                    .await?;
+                txs.push(format!(
+                    "  ✅ revoked {} · <code>{}</code>",
+                    b.mint,
+                    short_addr(&sig)
+                ));
             }
             repo::set_setting(state.db.conn(), user_id, &setting_key, "off").await?;
             if txs.is_empty() {
@@ -1158,11 +1120,22 @@ async fn sponsorship_status(
     wallet: &crate::db::models::Wallet,
 ) -> Result<String> {
     let setting_key = format!("sponsor:{}", chain.id);
-    let opt_in = repo::get_setting(state.db.conn(), user_id, &setting_key).await?.unwrap_or_default();
+    let opt_in = repo::get_setting(state.db.conn(), user_id, &setting_key)
+        .await?
+        .unwrap_or_default();
     match chain.kind {
         crate::chains::ChainKind::Evm => {
-            let delegated = state.rpc.delegation_of(chain, &wallet.address).await.unwrap_or(None);
-            let sponsor_addr = state.swap.sponsor.as_ref().map(|(a, _)| a.clone()).unwrap_or_default();
+            let delegated = state
+                .rpc
+                .delegation_of(chain, &wallet.address)
+                .await
+                .unwrap_or(None);
+            let sponsor_addr = state
+                .swap
+                .sponsor
+                .as_ref()
+                .map(|(a, _)| a.clone())
+                .unwrap_or_default();
             let account = sponsor_account_for(state, chain).await.unwrap_or_default();
             Ok(format!(
                 "🪪 <b>Gas sponsorship</b> — {}\n\n\
@@ -1177,19 +1150,36 @@ async fn sponsorship_status(
                     Some(t) => format!("set → <code>{}</code>", short_addr(t)),
                     None => "none".to_string(),
                 },
-                if account.is_empty() { "— (run /sponsor setup)".to_string() } else { account },
-                if sponsor_addr.is_empty() { "not configured".to_string() } else { sponsor_addr },
+                if account.is_empty() {
+                    "— (run /sponsor setup)".to_string()
+                } else {
+                    account
+                },
+                if sponsor_addr.is_empty() {
+                    "not configured".to_string()
+                } else {
+                    sponsor_addr
+                },
             ))
         }
         crate::chains::ChainKind::Solana => {
-            let sp_addr = state.solana.sponsor.as_ref().map(|s| s.address()).unwrap_or_default();
+            let sp_addr = state
+                .solana
+                .sponsor
+                .as_ref()
+                .map(|s| s.address())
+                .unwrap_or_default();
             Ok(format!(
                 "🪐 <b>Gas sponsorship</b> — solana\n\n\
                  Opt-in: <b>{}</b>\n\
                  Sponsor (fee payer / delegate): <code>{}</code>\n\n\
                  /sponsor on · /sponsor off",
                 if opt_in == "on" { "ON ✅" } else { "off" },
-                if sp_addr.is_empty() { "not configured".to_string() } else { sp_addr },
+                if sp_addr.is_empty() {
+                    "not configured".to_string()
+                } else {
+                    sp_addr
+                },
             ))
         }
     }
@@ -1199,18 +1189,33 @@ async fn sponsorship_status(
 /// address in the global settings (user_id 0).
 async fn sponsorship_setup(state: &AppState, chain: &Chain) -> Result<String> {
     if chain.kind != crate::chains::ChainKind::Evm {
-        return Ok("🪐 Sponsor setup is EVM-only; Solana sponsorship uses the operator key directly.".to_string());
+        return Ok(
+            "🪐 Sponsor setup is EVM-only; Solana sponsorship uses the operator key directly."
+                .to_string(),
+        );
     }
     let Some((sponsor_addr, sponsor_secret)) = state.swap.sponsor.as_ref() else {
         return Ok("⚠️ SPONSOR_KEY is not set — the operator must configure it.".to_string());
     };
     if let Ok(account) = sponsor_account_for(state, chain).await {
         if !account.is_empty() {
-            return Ok(format!("✅ SponsorAccount already deployed on {}: <code>{}</code>", chain.id, account));
+            return Ok(format!(
+                "✅ SponsorAccount already deployed on {}: <code>{}</code>",
+                chain.id, account
+            ));
         }
     }
-    let (address, hash) = state.swap.deploy_sponsor_account(chain, sponsor_addr, sponsor_secret).await?;
-    repo::set_setting(state.db.conn(), 0, &format!("sponsor_account:{}", chain.id), &address).await?;
+    let (address, hash) = state
+        .swap
+        .deploy_sponsor_account(chain, sponsor_addr, sponsor_secret)
+        .await?;
+    repo::set_setting(
+        state.db.conn(),
+        0,
+        &format!("sponsor_account:{}", chain.id),
+        &address,
+    )
+    .await?;
     Ok(format!(
         "🏗️ <b>SponsorAccount deployed</b> ({})\n\n\
          Address: <code>{}</code>\n\
@@ -1223,16 +1228,12 @@ async fn sponsorship_setup(state: &AppState, chain: &Chain) -> Result<String> {
         chain.explorer_link(&hash)
     ))
 }
-
-/// Look up the deployed SponsorAccount address for a chain (global setting).
-async fn sponsor_account_for(state: &AppState, chain: &Chain) -> Result<String> {
-    Ok(repo::get_setting(state.db.conn(), 0, &format!("sponsor_account:{}", chain.id)).await?.unwrap_or_default())
-}
-
 /// Escape a string for Telegram HTML messages (external data may contain
 /// markup — token symbols/names come from DexScreener, errors from RPCs).
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 async fn cmd_settings(state: &AppState, msg: &Message, arg: Option<String>) -> Result<String> {
@@ -1250,8 +1251,16 @@ async fn cmd_settings(state: &AppState, msg: &Message, arg: Option<String>) -> R
                  Change: /settings slippage 0.05 · /chain bsc",
                 slippage * 100.0,
                 chain.display(),
-                if state.config.paper_trading { "ON" } else { "OFF" },
-                if state.swap.enabled() { "ON" } else { "OFF (set ZEROEX_API_KEY)" }
+                if state.config.paper_trading {
+                    "ON"
+                } else {
+                    "OFF"
+                },
+                if state.swap.enabled() {
+                    "ON"
+                } else {
+                    "OFF (set ZEROEX_API_KEY)"
+                }
             ))
         }
         Some(rest) => {
@@ -1273,7 +1282,10 @@ async fn cmd_settings(state: &AppState, msg: &Message, arg: Option<String>) -> R
                     let name = parts.next().context("usage: /settings chain bsc")?;
                     let chain = Chain::resolve(name).context("unknown chain — see /chains")?;
                     repo::set_setting(state.db.conn(), user_id, "chain", chain.id).await?;
-                    Ok(format!("⛓️ Default chain set to <b>{}</b>", chain.display()))
+                    Ok(format!(
+                        "⛓️ Default chain set to <b>{}</b>",
+                        chain.display()
+                    ))
                 }
                 other => Ok(format!(
                     "Unknown setting <code>{other:?}</code>. Try: /settings slippage 0.05",
@@ -1282,7 +1294,6 @@ async fn cmd_settings(state: &AppState, msg: &Message, arg: Option<String>) -> R
         }
     }
 }
-
 
 async fn cmd_alert(
     state: &AppState,
@@ -1298,7 +1309,8 @@ async fn cmd_alert(
     if cond != "above" && cond != "below" {
         bail!("condition must be <code>above</code> or <code>below</code>");
     }
-    let alert = repo::insert_alert(state.db.conn(), user_id, chain.id, &token, &cond, price).await?;
+    let alert =
+        repo::insert_alert(state.db.conn(), user_id, chain.id, &token, &cond, price).await?;
     let quote = state.market.quote(chain, &token).await;
     Ok(format!(
         "🔔 <b>Alert created</b> #<code>{}</code>\n\n\
@@ -1329,13 +1341,16 @@ async fn cmd_alerts(state: &AppState, msg: &Message) -> Result<String> {
             a.id,
             a.network,
             short_addr(&a.token_address),
-            if a.condition == "above" { "↑ above" } else { "↓ below" },
+            if a.condition == "above" {
+                "↑ above"
+            } else {
+                "↓ below"
+            },
             format_price(a.target_price)
         ));
     }
     Ok(s)
 }
-
 
 async fn cmd_limit(
     state: &AppState,
@@ -1398,104 +1413,21 @@ async fn user_slippage(state: &AppState, user_id: i64) -> Result<f64> {
         None => Ok(0.05),
     }
 }
-
-
-/// Default wallet for a chain: Solana wallets are separate from EVM wallets.
-async fn wallet_for_chain(
-    state: &AppState,
-    user_id: i64,
-    chain: &Chain,
-) -> Result<crate::db::models::Wallet> {
-    let network = if chain.kind == crate::chains::ChainKind::Solana { "solana" } else { "ethereum" };
-    match repo::get_default_wallet_for(state.db.conn(), user_id, network).await? {
-        Some(w) => Ok(w),
-        None => {
-            let hint = if chain.kind == crate::chains::ChainKind::Solana {
-                "create a Solana wallet first with /wallet new solana"
-            } else {
-                "create a wallet first with /wallet new"
-            };
-            Err(anyhow::anyhow!("{}", hint))
-        }
-    }
-}
-/// Whether the user opted into gas sponsorship on this chain (and it's configured).
-async fn user_sponsorship(state: &AppState, user_id: i64, chain: &Chain) -> Result<bool> {
-    let setting = repo::get_setting(state.db.conn(), user_id, &format!("sponsor:{}", chain.id)).await?;
-    if setting.as_deref() != Some("on") {
-        return Ok(false);
-    }
-    Ok(match chain.kind {
-        crate::chains::ChainKind::Evm => state.swap.sponsor.is_some(),
-        crate::chains::ChainKind::Solana => state.solana.sponsor.is_some(),
-    })
-}
-
 /// Parse `chain:0x…` / `0x…` token arguments.
 fn parse_token_arg(input: &str, default: &'static Chain) -> Result<(&'static Chain, String)> {
     Chain::resolve_token_arg(input, default)
         .ok_or_else(|| anyhow::anyhow!("invalid token — expected <chain:0x…> or <0x…>"))
 }
-
-/// Decrypt the wallet's private key for live signing.
-fn wallet_secret(state: &AppState, wallet: &crate::db::models::Wallet) -> Result<[u8; 32]> {
-    let enc = wallet
-        .encrypted_key
-        .as_ref()
-        .context("wallet is watch-only — import its private key with /wallet import <key> to trade live")?;
-    let bytes = state.keyring.decrypt(enc)?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("decrypted key has wrong length"))
-}
-
-/// Record a live (on-chain) order + update paper accounting atomically.
-async fn record_live_order(
-    state: &AppState,
-    user_id: i64,
-    wallet_id: Option<i64>,
-    chain: &Chain,
-    token: &str,
-    side: &str,
-    amount_in: f64,
-    amount_out: f64,
-    price: f64,
-    slippage: f64,
-    tx_hash: &str,
-) -> Result<()> {
-    let conn = state.db.conn();
-    let tx = conn.transaction().await?;
-    if side == "sell" {
-        let _ = repo::reduce_position(&tx, user_id, chain.id, token, amount_in, price).await;
-    } else {
-        repo::add_to_position(&tx, user_id, wallet_id, chain.id, token, amount_out, price).await?;
-    }
-    repo::insert_order(
-        &tx,
-        &repo::NewOrder {
-            user_id,
-            wallet_id,
-            network: chain.id,
-            token_address: token,
-            side,
-            amount_in: Some(amount_in),
-            amount_out: Some(amount_out),
-            price: Some(price),
-            slippage,
-            status: "executed",
-            tx_hash: Some(tx_hash),
-            error: None,
-        },
-    )
-    .await?;
-    let _ = repo::trigger_satisfied_alerts(&tx, user_id, token, price).await?;
-    tx.commit().await?;
-    Ok(())
-}
-
 async fn token_symbol(state: &AppState, chain: &Chain, token: &str) -> String {
-    match repo::get_token(state.db.conn(), chain.id, token).await.ok().flatten() {
-        Some(t) => t.symbol.map(|s| esc(&s)).unwrap_or_else(|| short_addr(token)),
+    match repo::get_token(state.db.conn(), chain.id, token)
+        .await
+        .ok()
+        .flatten()
+    {
+        Some(t) => t
+            .symbol
+            .map(|s| esc(&s))
+            .unwrap_or_else(|| short_addr(token)),
         None => short_addr(token),
     }
 }
@@ -1597,16 +1529,63 @@ fn alert_note(fired: i64) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn esc_escapes_html() {
-        assert_eq!(esc("<b>bold</b> & x"), "&lt;b&gt;bold&lt;/b&gt; &amp; x");
-        assert_eq!(esc("plain"), "plain");
-        assert_eq!(esc("a<b"), "a&lt;b");
+/// Send a reply as one or more Telegram messages. Telegram caps messages at
+/// 4096 characters, so long replies (portfolios, trending, ...) are split on
+/// line boundaries and each chunk is sent separately.
+async fn send_reply(bot: &Bot, chat_id: ChatId, text: &str) {
+    for chunk in chunk_message(text, 4096) {
+        let _ = bot
+            .send_message(chat_id, chunk)
+            .parse_mode(ParseMode::Html)
+            .await;
     }
+}
+
+/// Split a message into chunks of at most 'limit' chars, preferring newline
+/// boundaries; an oversized single line is hard-split at a UTF-8 boundary.
+fn chunk_message(text: &str, limit: usize) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for line in text.split_inclusive('\n') {
+        if line.len() > limit {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            for part in hard_split(line, limit) {
+                chunks.push(part);
+            }
+        } else if !current.is_empty() && current.len() + line.len() > limit {
+            chunks.push(std::mem::take(&mut current));
+            current.push_str(line);
+        } else {
+            current.push_str(line);
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
+/// Hard-split a single line at char boundaries of at most 'limit' bytes each.
+fn hard_split(text: &str, limit: usize) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while rest.len() > limit {
+        let mut split = limit;
+        while !rest.is_char_boundary(split) {
+            split -= 1;
+        }
+        parts.push(rest[..split].to_string());
+        rest = &rest[split..];
+    }
+    if !rest.is_empty() {
+        parts.push(rest.to_string());
+    }
+    parts
 }
 
 fn help_text() -> &'static str {
@@ -1632,3 +1611,31 @@ fn help_text() -> &'static str {
      e.g. <code>/buy sol:EPjF… 0.5</code>"
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn esc_escapes_html() {
+        assert_eq!(esc("<b>bold</b> & x"), "&lt;b&gt;bold&lt;/b&gt; &amp; x");
+        assert_eq!(esc("plain"), "plain");
+        assert_eq!(esc("a<b"), "a&lt;b");
+    }
+
+    #[test]
+    fn chunk_message_respects_limit_and_rejoins() {
+        // Multi-line text that needs several chunks.
+        let text: String = (0..50).map(|i| format!("line {i:02}\n")).collect();
+        let chunks = chunk_message(&text, 60);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| c.len() <= 60));
+        assert_eq!(chunks.concat(), text);
+
+        // A single oversized line is hard-split without breaking UTF-8.
+        let long: String = "€".repeat(100) + "\n";
+        let chunks = chunk_message(&long, 30);
+        assert!(chunks.iter().all(|c| c.len() <= 30));
+        assert_eq!(chunks.concat(), long);
+        assert!(chunks.iter().all(|c| c.is_char_boundary(c.len())));
+    }
+}

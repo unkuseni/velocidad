@@ -214,6 +214,8 @@ src/
 | `SPONSOR_KEY` | — | EIP-7702 gas-sponsorship operator key (0x-hex) |
 | `SPONSOR_SOLANA_KEY` | — | Solana gas-sponsorship operator key (seed) |
 | `MASTER_KEY` | auto-generated | 64-hex AES key for wallet encryption (0x allowed) |
+| `BOT_RATE_PER_MIN` | `30` | max bot commands per user per minute (0 disables) |
+| `API_RATE_PER_MIN` | `120` | max API requests per IP per minute (0 disables) |
 
 All vars can also be prefixed `VELOCIDAD_` (e.g. `VELOCIDAD_API_PORT`).
 
@@ -226,8 +228,27 @@ All vars can also be prefixed `VELOCIDAD_` (e.g. `VELOCIDAD_API_PORT`).
 - API responses include `price_source` (`dexscreener` vs `simulator`); the bot
   warns and the limit-order matcher refuses fills when no live price exists.
 - `API_KEY` bearer auth protects `/api/v1/*` (open dev mode with a warning).
+  Key comparison is constant-time; the API rate-limits per IP (429 +
+  `Retry-After`), and the bot rate-limits commands per user.
+- Long Telegram replies (portfolios, trending, history) are split into
+  multiple messages so none exceed Telegram's 4096-char cap.
+- Background workers fetch quotes in bulk (one DexScreener request per chain
+  per tick) and never trigger limit orders or alerts on zero/unpriced tokens.
+- RPC calls retry every endpoint with exponential backoff (3 rounds).
+- Migrations are idempotent (`IF NOT EXISTS` / `IF EXISTS` guards) and
+  tolerate partially-applied column additions.
+- Startup validates the configuration and logs warnings for likely
+  misconfigurations (e.g. live mode without a 0x key).
 
 ## Tests
+
+```bash
+cargo test          # Rust unit/integration tests
+forge test          # in contracts/ — SponsorAccount security tests (Foundry)
+```
+
+The CI workflow (GitHub Actions) also runs `cargo fmt --check`,
+`cargo clippy -D warnings`, the release build, and the Foundry suite.
 
 ```bash
 cargo test

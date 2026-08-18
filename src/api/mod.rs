@@ -12,9 +12,10 @@
 //! - `GET  /api/v1/alerts/:telegram_id`         — user alerts
 //! - `POST /api/v1/alerts`                      — create an alert
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -23,14 +24,20 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
+use subtle::ConstantTimeEq;
 
 use crate::app::AppState;
 use crate::chains;
 use crate::db::repo;
+use crate::exec;
 
 pub fn router(state: Arc<AppState>) -> Router {
     let api_key = state.config.api_key.clone();
-    if api_key.as_ref().map(|k| k.trim().is_empty()).unwrap_or(true) {
+    if api_key
+        .as_ref()
+        .map(|k| k.trim().is_empty())
+        .unwrap_or(true)
+    {
         tracing::warn!(
             "API_KEY is not set — the HTTP API is running OPEN. Set API_KEY to require \
              Authorization: Bearer <key> on /api/v1/* endpoints."
@@ -50,22 +57,21 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/alerts/:telegram_id", get(alerts))
         .route("/api/v1/alerts", post(create_alert))
         // Everything under /api/v1 requires the bearer token when configured.
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_key,
+        ))
+        // Per-IP rate limit (outermost layer: checked before auth).
+        .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .with_state(state);
 
     // /health stays open for load balancers/probes.
-    Router::new()
-        .route("/health", get(health))
-        .merge(api)
+    Router::new().route("/health", get(health)).merge(api)
 }
 
 /// Rejects requests without a matching `Authorization: Bearer <API_KEY>` when
 /// `API_KEY` is configured. Open (dev) mode when unset.
-async fn require_api_key(
-    State(state): State<Arc<AppState>>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn require_api_key(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let Some(expected) = state.config.api_key.as_ref() else {
         return next.run(req).await;
     };
@@ -78,7 +84,12 @@ async fn require_api_key(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|k| k.trim());
-    if supplied == Some(expected.as_str()) {
+    // Constant-time comparison so key length can't leak through timing.
+    let ok = match supplied {
+        Some(k) => bool::from(expected.as_bytes().ct_eq(k.as_bytes())),
+        None => false,
+    };
+    if ok {
         return next.run(req).await;
     }
     (
@@ -94,8 +105,30 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> anyhow::Result<()> {
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "HTTP API listening on http://0.0.0.0:{port}");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
+}
+
+/// 429s requests from an IP exceeding the configured per-minute limit.
+async fn rate_limit(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Err(retry) = state.api_rate.check(&format!("ip:{}", addr.ip())) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("Retry-After", retry.to_string())],
+            Json(json!({ "error": format!("rate limit exceeded — retry in {retry}s") })),
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 type ApiResult = (StatusCode, Json<serde_json::Value>);
@@ -136,15 +169,18 @@ async fn chain_list() -> Json<serde_json::Value> {
     Json(json!({ "chains": chains }))
 }
 
-async fn user_info(
-    State(state): State<Arc<AppState>>,
-    Path(telegram_id): Path<i64>,
-) -> ApiResult {
+async fn user_info(State(state): State<Arc<AppState>>, Path(telegram_id): Path<i64>) -> ApiResult {
     match repo::get_user(state.db.conn(), telegram_id).await {
         Ok(Some(user)) => {
-            let wallets = repo::list_wallets(state.db.conn(), user.id).await.unwrap_or_default();
-            let orders = repo::list_orders(state.db.conn(), user.id, 100).await.unwrap_or_default();
-            let positions = repo::list_positions(state.db.conn(), user.id).await.unwrap_or_default();
+            let wallets = repo::list_wallets(state.db.conn(), user.id)
+                .await
+                .unwrap_or_default();
+            let orders = repo::list_orders(state.db.conn(), user.id, 100)
+                .await
+                .unwrap_or_default();
+            let positions = repo::list_positions(state.db.conn(), user.id)
+                .await
+                .unwrap_or_default();
             ok(json!({
                 "user": user,
                 "wallets": wallets,
@@ -160,10 +196,7 @@ async fn user_info(
     }
 }
 
-async fn portfolio(
-    State(state): State<Arc<AppState>>,
-    Path(telegram_id): Path<i64>,
-) -> ApiResult {
+async fn portfolio(State(state): State<Arc<AppState>>, Path(telegram_id): Path<i64>) -> ApiResult {
     match repo::get_user(state.db.conn(), telegram_id).await {
         Ok(Some(user)) => {
             let positions = match repo::list_positions(state.db.conn(), user.id).await {
@@ -174,7 +207,8 @@ async fn portfolio(
             let mut totals: std::collections::BTreeMap<String, f64> = Default::default();
             let mut total_usd = 0.0;
             for p in &positions {
-                let chain = chains::by_id(&p.network).unwrap_or_else(|| chains::by_id("ethereum").unwrap());
+                let chain =
+                    chains::by_id(&p.network).unwrap_or_else(|| chains::by_id("ethereum").unwrap());
                 let quote = state.market.quote(chain, &p.token_address).await;
                 let price = quote.price_native;
                 let value = p.quantity * price;
@@ -220,21 +254,42 @@ async fn balances(
         Ok(Some(user)) => {
             let chain = match params.chain.as_deref().and_then(chains::Chain::resolve) {
                 Some(c) => c,
-                None => chains::by_id(&state.config.default_chain).unwrap_or_else(|| chains::by_id("ethereum").unwrap()),
+                None => chains::by_id(&state.config.default_chain)
+                    .unwrap_or_else(|| chains::by_id("ethereum").unwrap()),
             };
-            let wallet = match repo::get_default_wallet_for(state.db.conn(), user.id, chain.id).await {
+            let wallet = match repo::get_default_wallet_for(state.db.conn(), user.id, chain.id)
+                .await
+            {
                 Ok(Some(w)) => w,
                 Ok(None) => match repo::get_default_wallet(state.db.conn(), user.id).await {
                     Ok(Some(w)) => w,
-                    _ => return ok(json!({ "telegram_id": telegram_id, "chain": chain.id, "balances": [] })),
+                    _ => {
+                        return ok(
+                            json!({ "telegram_id": telegram_id, "chain": chain.id, "balances": [] }),
+                        )
+                    }
                 },
                 Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, &e),
             };
             let native_usd = state.market.native_price_usd(chain).await;
             let mut tokens: Vec<serde_json::Value> = Vec::new();
             let (native_balance, native_divisor) = match chain.kind {
-                chains::ChainKind::Evm => (state.rpc.native_balance(chain, &wallet.address).await.unwrap_or(0), 1e18),
-                chains::ChainKind::Solana => (state.solana.balance(chain, &wallet.address).await.unwrap_or(0) as u128, 1e9),
+                chains::ChainKind::Evm => (
+                    state
+                        .rpc
+                        .native_balance(chain, &wallet.address)
+                        .await
+                        .unwrap_or(0),
+                    1e18,
+                ),
+                chains::ChainKind::Solana => (
+                    state
+                        .solana
+                        .balance(chain, &wallet.address)
+                        .await
+                        .unwrap_or(0) as u128,
+                    1e9,
+                ),
             };
             if chain.kind == chains::ChainKind::Solana {
                 if let Ok(balances) = state.solana.spl_balances(chain, &wallet.address).await {
@@ -245,9 +300,11 @@ async fn balances(
                             items.push((q.symbol, b.amount, q.price_usd * b.amount));
                         }
                     }
-                    items.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                    items
+                        .sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
                     for (symbol, amount, usd) in items.iter().take(6) {
-                        tokens.push(json!({ "symbol": symbol, "balance": amount, "usd_value": usd }));
+                        tokens
+                            .push(json!({ "symbol": symbol, "balance": amount, "usd_value": usd }));
                     }
                 }
             } else {
@@ -256,7 +313,8 @@ async fn balances(
                         let decimals = state.rpc.erc20_decimals(chain, addr).await;
                         let bal = raw as f64 / 10f64.powi(decimals as i32);
                         if bal > 0.0 {
-                            tokens.push(json!({ "symbol": symbol, "address": addr, "balance": bal }));
+                            tokens
+                                .push(json!({ "symbol": symbol, "address": addr, "balance": bal }));
                         }
                     }
                 }
@@ -323,8 +381,6 @@ async fn create_trade(
 ) -> ApiResult {
     let result = async {
         let user = repo::get_or_create_user(state.db.conn(), req.telegram_id, None, None).await?;
-        let wallet = repo::get_default_wallet(state.db.conn(), user.id).await?;
-        let wallet_id = wallet.map(|w| w.id);
         let chain = match req.chain.as_deref().and_then(chains::Chain::resolve) {
             Some(c) => c,
             None => match repo::user_chain(state.db.conn(), user.id, &state.config.default_chain).await {
@@ -333,38 +389,51 @@ async fn create_trade(
             },
         };
 
+        // Live mode needs a wallet; paper mode keeps working without one.
+        let wallet = match exec::wallet_for_chain(&state, user.id, chain).await {
+            Ok(w) => Some(w),
+            Err(e) if state.config.paper_trading => {
+                tracing::debug!(err = %e, "no wallet — falling back to paper engine fill");
+                None
+            }
+            Err(e) => return Err(e),
+        };
+
         match req.side.as_str() {
             "buy" | "snipe" => {
-                let r = state
-                    .engine
-                    .buy(
-                        &state.db,
-                        chain,
-                        user.id,
-                        wallet_id,
-                        &req.token_address,
-                        req.amount,
-                        req.slippage,
-                        &req.side,
-                    )
-                    .await?;
-                Ok(json!({ "status": "filled", "mode": "paper", "chain": chain.id, "receipt": serde_json::to_value(&r)? }))
+                if req.side == "snipe" {
+                    let report = state.scanner.scan(&state.db, chain, &req.token_address).await;
+                    if report.is_honeypot {
+                        anyhow::bail!("token is flagged as a honeypot — snipe blocked");
+                    }
+                }
+                match wallet {
+                    Some(w) => {
+                        let outcome = exec::buy(&state, chain, user.id, &w, &req.token_address, req.amount, req.slippage, &req.side).await?;
+                        Ok(json!({ "status": "filled", "chain": chain.id, "outcome": serde_json::to_value(&outcome)? }))
+                    }
+                    None => {
+                        let r = state
+                            .engine
+                            .buy(&state.db, chain, user.id, None, &req.token_address, req.amount, req.slippage, &req.side)
+                            .await?;
+                        Ok(json!({ "status": "filled", "mode": "paper", "chain": chain.id, "receipt": serde_json::to_value(&r)? }))
+                    }
+                }
             }
-            "sell" => {
-                let r = state
-                    .engine
-                    .sell(
-                        &state.db,
-                        chain,
-                        user.id,
-                        wallet_id,
-                        &req.token_address,
-                        req.amount,
-                        req.slippage,
-                    )
-                    .await?;
-                Ok(json!({ "status": "filled", "mode": "paper", "chain": chain.id, "receipt": serde_json::to_value(&r)? }))
-            }
+            "sell" => match wallet {
+                Some(w) => {
+                    let outcome = exec::sell(&state, chain, user.id, &w, &req.token_address, req.amount, req.slippage).await?;
+                    Ok(json!({ "status": "filled", "chain": chain.id, "outcome": serde_json::to_value(&outcome)? }))
+                }
+                None => {
+                    let r = state
+                        .engine
+                        .sell(&state.db, chain, user.id, None, &req.token_address, req.amount, req.slippage)
+                        .await?;
+                    Ok(json!({ "status": "filled", "mode": "paper", "chain": chain.id, "receipt": serde_json::to_value(&r)? }))
+                }
+            },
             other => Err(anyhow::anyhow!("unknown side '{other}' (expected buy|sell|snipe)")),
         }
     }
@@ -386,7 +455,6 @@ struct SearchQuery {
     q: String,
 }
 
-
 #[derive(Debug, Deserialize)]
 struct SponsorQuery {
     chain: Option<String>,
@@ -401,13 +469,24 @@ async fn sponsor_status(
         Ok(Some(user)) => {
             let chain = match params.chain.as_deref().and_then(chains::Chain::resolve) {
                 Some(c) => c,
-                None => match repo::user_chain(state.db.conn(), user.id, &state.config.default_chain).await {
-                    Ok(id) => chains::by_id(&id).unwrap_or_else(|| chains::by_id("ethereum").unwrap()),
-                    Err(_) => chains::by_id("ethereum").unwrap(),
-                },
+                None => {
+                    match repo::user_chain(state.db.conn(), user.id, &state.config.default_chain)
+                        .await
+                    {
+                        Ok(id) => {
+                            chains::by_id(&id).unwrap_or_else(|| chains::by_id("ethereum").unwrap())
+                        }
+                        Err(_) => chains::by_id("ethereum").unwrap(),
+                    }
+                }
             };
-            let wallet = repo::get_default_wallet_for(state.db.conn(), user.id, chain.id).await.unwrap_or(None);
-            let opt_in = repo::get_setting(state.db.conn(), user.id, &format!("sponsor:{}", chain.id)).await.unwrap_or(None);
+            let wallet = repo::get_default_wallet_for(state.db.conn(), user.id, chain.id)
+                .await
+                .unwrap_or(None);
+            let opt_in =
+                repo::get_setting(state.db.conn(), user.id, &format!("sponsor:{}", chain.id))
+                    .await
+                    .unwrap_or(None);
             let mut status = json!({
                 "telegram_id": telegram_id,
                 "chain": chain.id,
@@ -422,7 +501,11 @@ async fn sponsor_status(
                         status["sponsor"] = json!(addr);
                     }
                     if let Some(w) = &wallet {
-                        status["delegation"] = json!(state.rpc.delegation_of(chain, &w.address).await.unwrap_or(None));
+                        status["delegation"] = json!(state
+                            .rpc
+                            .delegation_of(chain, &w.address)
+                            .await
+                            .unwrap_or(None));
                     }
                 }
                 chains::ChainKind::Solana => {
@@ -430,7 +513,7 @@ async fn sponsor_status(
                         status["sponsor_configured"] = json!(true);
                         status["sponsor"] = json!(sp.address());
                     }
-                },
+                }
             }
             ok(status)
         }
@@ -460,11 +543,14 @@ async fn token_info(
 ) -> ApiResult {
     let chain = match params.chain.as_deref().and_then(chains::Chain::resolve) {
         Some(c) => c,
-        None => chains::by_id(&state.config.default_chain).unwrap_or_else(|| chains::by_id("ethereum").unwrap()),
+        None => chains::by_id(&state.config.default_chain)
+            .unwrap_or_else(|| chains::by_id("ethereum").unwrap()),
     };
     let quote = state.market.quote(chain, &address).await;
     let report = state.scanner.scan(&state.db, chain, &address).await;
-    let cached = repo::get_token(state.db.conn(), chain.id, &address).await.unwrap_or(None);
+    let cached = repo::get_token(state.db.conn(), chain.id, &address)
+        .await
+        .unwrap_or(None);
     ok(json!({
         "address": address,
         "chain": chain.id,
@@ -476,10 +562,7 @@ async fn token_info(
     }))
 }
 
-async fn alerts(
-    State(state): State<Arc<AppState>>,
-    Path(telegram_id): Path<i64>,
-) -> ApiResult {
+async fn alerts(State(state): State<Arc<AppState>>, Path(telegram_id): Path<i64>) -> ApiResult {
     match repo::get_user(state.db.conn(), telegram_id).await {
         Ok(Some(user)) => match repo::list_alerts(state.db.conn(), user.id).await {
             Ok(items) => ok(json!({ "telegram_id": telegram_id, "alerts": items })),
@@ -514,7 +597,9 @@ async fn create_alert(
         }
         let network = match req.chain.as_deref().and_then(chains::Chain::resolve) {
             Some(c) => c.id.to_string(),
-            None => match repo::user_chain(state.db.conn(), user.id, &state.config.default_chain).await {
+            None => match repo::user_chain(state.db.conn(), user.id, &state.config.default_chain)
+                .await
+            {
                 Ok(id) => id,
                 Err(_) => "ethereum".to_string(),
             },

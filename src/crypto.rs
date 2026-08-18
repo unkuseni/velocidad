@@ -40,7 +40,10 @@ pub fn generate_wallet() -> Result<GeneratedWallet> {
 
 /// Import a keypair from a hex-encoded private key (with or without `0x`).
 pub fn import_wallet(private_key_hex: &str) -> Result<GeneratedWallet> {
-    let cleaned = private_key_hex.trim().strip_prefix("0x").unwrap_or(private_key_hex.trim());
+    let cleaned = private_key_hex
+        .trim()
+        .strip_prefix("0x")
+        .unwrap_or(private_key_hex.trim());
     let bytes = hex::decode(cleaned).context("private key must be 64 hex characters")?;
     if bytes.len() != 32 {
         bail!("private key must be exactly 32 bytes (64 hex characters)");
@@ -82,7 +85,9 @@ impl Keyring {
                     k.copy_from_slice(&bytes);
                     k
                 }
-                Ok(_) => bail!("velocidad.key exists but is not 32 bytes; delete it or set MASTER_KEY"),
+                Ok(_) => {
+                    bail!("velocidad.key exists but is not 32 bytes; delete it or set MASTER_KEY")
+                }
                 Err(_) => {
                     let mut k = [0u8; 32];
                     rand::rngs::OsRng.fill_bytes(&mut k);
@@ -111,7 +116,6 @@ impl Keyring {
         Ok(hex::encode(blob))
     }
 
-
     /// Decrypt hex(nonce || ciphertext) → plaintext.
     ///
     /// Used when signing live transactions with a stored wallet key.
@@ -129,8 +133,6 @@ impl Keyring {
             .map_err(|_| anyhow!("decryption failed (wrong master key?)"))
     }
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Solana wallets — ed25519 keypairs with base58 addresses.
@@ -165,9 +167,9 @@ pub fn import_solana_wallet(input: &str) -> Result<SolanaWallet> {
     } else if cleaned.len() == 64 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
         hex::decode(cleaned).context("invalid hex private key")?
     } else {
-        bs58::decode(cleaned)
-            .into_vec()
-            .context("invalid base58 private key — expected a Phantom-style 64-byte key or a 32-byte seed")?
+        bs58::decode(cleaned).into_vec().context(
+            "invalid base58 private key — expected a Phantom-style 64-byte key or a 32-byte seed",
+        )?
     };
     let seed: [u8; 32] = match bytes.len() {
         32 => bytes.try_into().expect("length checked"),

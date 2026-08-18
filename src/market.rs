@@ -138,6 +138,80 @@ struct DexTxnSide {
     sells: Option<u64>,
 }
 
+/// Best pair for a token among DexScreener's pairs: highest liquidity among
+/// pairs where the requested token is the BASE token, preferring pairs quoted
+/// in the chain native or a stablecoin — bogus pairings like a broken
+/// JUP/MET pool can otherwise dominate by liquidity.
+fn best_pair<'a>(chain: &Chain, pairs: &'a [DexPair], token: &str) -> Option<&'a DexPair> {
+    let token_lower = token.to_lowercase();
+    let base_matches = |p: &&DexPair| {
+        p.chain_id.as_deref() == Some(chain.dex_segment)
+            && p.base_token
+                .as_ref()
+                .and_then(|t| t.address.as_deref())
+                .map(|a| a.to_lowercase() == token_lower)
+                .unwrap_or(false)
+    };
+    let safe_quote = |p: &&DexPair| {
+        let sym = p
+            .quote_token
+            .as_ref()
+            .and_then(|t| t.symbol.as_deref())
+            .map(|s| s.to_uppercase());
+        let addr = p
+            .quote_token
+            .as_ref()
+            .and_then(|t| t.address.as_deref())
+            .map(|a| a.to_lowercase());
+        let native = chain.native.to_uppercase();
+        let wrapped = format!("W{}", chain.native).to_uppercase();
+        let stable = match sym.as_deref() {
+            Some(s) => {
+                let s = s.to_uppercase();
+                s == native
+                    || s == wrapped
+                    || matches!(
+                        s.as_str(),
+                        "USDC"
+                            | "USDT"
+                            | "DAI"
+                            | "BUSD"
+                            | "FDUSD"
+                            | "USDS"
+                            | "PYUSD"
+                            | "USDY"
+                            | "TUSD"
+                    )
+            }
+            None => false,
+        };
+        stable || addr.as_deref() == Some(&chain.wrapped_native.to_lowercase())
+    };
+    pairs
+        .iter()
+        .filter(base_matches)
+        .filter(safe_quote)
+        .max_by(|a, b| {
+            a.liquidity
+                .as_ref()
+                .and_then(|l| l.usd)
+                .unwrap_or(0.0)
+                .partial_cmp(&b.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .or_else(|| {
+            // Fall back to any base-matching pair when no safe-quote pair exists.
+            pairs.iter().filter(base_matches).max_by(|a, b| {
+                a.liquidity
+                    .as_ref()
+                    .and_then(|l| l.usd)
+                    .unwrap_or(0.0)
+                    .partial_cmp(&b.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        })
+}
+
 /// Live market data with cache + simulator fallback.
 pub struct MarketData {
     http: reqwest::Client,
@@ -188,85 +262,103 @@ impl MarketData {
 
         match fetched {
             Some(q) => {
-                self.quote_cache.lock().unwrap().insert(key, (Instant::now(), q.clone()));
+                self.quote_cache
+                    .lock()
+                    .unwrap()
+                    .insert(key, (Instant::now(), q.clone()));
                 q
             }
             None => self.simulate(chain, token),
         }
     }
 
+    /// Bulk best-quotes for several tokens on ONE chain: one HTTP request per
+    /// chunk of 30 tokens (DexScreener's batch limit). Serves from cache when
+    /// fresh; unlisted or unreachable tokens fall back to the simulator.
+    pub async fn quotes_batch(
+        &self,
+        chain: &Chain,
+        tokens: &[String],
+    ) -> HashMap<String, TokenQuote> {
+        let mut out: HashMap<String, TokenQuote> = HashMap::new();
+        let mut missing: Vec<String> = Vec::new();
+        for t in tokens {
+            let key = (chain.id.to_string(), t.to_lowercase());
+            if let Some((at, q)) = self.quote_cache.lock().unwrap().get(&key) {
+                if at.elapsed() < QUOTE_TTL {
+                    out.insert(t.to_lowercase(), q.clone());
+                    continue;
+                }
+            }
+            missing.push(t.clone());
+        }
+        if self.live {
+            for chunk in missing.chunks(30) {
+                for (t, q) in self.fetch_quotes(chain, chunk).await {
+                    let key = (chain.id.to_string(), t.to_lowercase());
+                    self.quote_cache
+                        .lock()
+                        .unwrap()
+                        .insert(key, (Instant::now(), q.clone()));
+                    out.insert(t, q);
+                }
+            }
+        }
+        for t in missing {
+            out.entry(t.to_lowercase())
+                .or_insert_with(|| self.simulate(chain, &t));
+        }
+        out
+    }
+
     /// Hit the DexScreener API for the best pair on this chain.
     async fn fetch_quote(&self, chain: &Chain, token: &str) -> Option<TokenQuote> {
         let url = format!("https://api.dexscreener.com/latest/dex/tokens/{token}");
         let resp: DexPairsResponse = self.http.get(&url).send().await.ok()?.json().await.ok()?;
-        if resp.pairs.is_empty() {
-            return None;
+        let best = best_pair(chain, &resp.pairs, token)?;
+        self.build_quote(chain, token, best).await
+    }
+
+    /// Bulk variant: /tokens/v1 returns a flat pair array for up to 30 tokens.
+    async fn fetch_quotes(&self, chain: &Chain, tokens: &[String]) -> HashMap<String, TokenQuote> {
+        let mut out = HashMap::new();
+        if tokens.is_empty() {
+            return out;
         }
-
-        // Best pair for this chain = highest liquidity among pairs where the
-        // requested token is the BASE token (when a token appears as the quote
-        // side, prices describe the other token). Additionally prefer pairs
-        // quoted in the chain native or a stablecoin — bogus pairings like a
-        // broken JUP/MET pool can otherwise dominate by liquidity.
-        let token_lower = token.to_lowercase();
-        let base_matches = |p: &&DexPair| {
-            p.chain_id.as_deref() == Some(chain.dex_segment)
-                && p.base_token
-                    .as_ref()
-                    .and_then(|t| t.address.as_deref())
-                    .map(|a| a.to_lowercase() == token_lower)
-                    .unwrap_or(false)
+        let url = format!(
+            "https://api.dexscreener.com/tokens/v1/{}/{}",
+            chain.dex_segment,
+            tokens.join(",")
+        );
+        let pairs: Vec<DexPair> = match self.http.get(&url).send().await {
+            Ok(resp) => resp.json().await.unwrap_or_default(),
+            Err(_) => return out,
         };
-        let safe_quote = |p: &&DexPair| {
-            let sym = p
-                .quote_token
-                .as_ref()
-                .and_then(|t| t.symbol.as_deref())
-                .map(|s| s.to_uppercase());
-            let addr = p
-                .quote_token
-                .as_ref()
-                .and_then(|t| t.address.as_deref())
-                .map(|a| a.to_lowercase());
-            let native = chain.native.to_uppercase();
-            let wrapped = format!("W{}", chain.native).to_uppercase();
-            let stable = match sym.as_deref() {
-                Some(s) => {
-                    let s = s.to_uppercase();
-                    s == native
-                        || s == wrapped
-                        || matches!(
-                            s.as_str(),
-                            "USDC" | "USDT" | "DAI" | "BUSD" | "FDUSD" | "USDS" | "PYUSD" | "USDY" | "TUSD"
-                        )
-                }
-                None => false,
-            };
-            stable || addr.as_deref() == Some(&chain.wrapped_native.to_lowercase())
-        };
-        let best = resp
-            .pairs
-            .iter()
-            .filter(base_matches)
-            .filter(safe_quote)
-            .max_by(|a, b| {
-                a.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0)
-                    .partial_cmp(&b.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .or_else(|| {
-                // Fall back to any base-matching pair when no safe-quote pair exists.
-                resp.pairs
-                    .iter()
-                    .filter(base_matches)
-                    .max_by(|a, b| {
-                        a.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0)
-                            .partial_cmp(&b.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-            })?;
-
         let native_usd = self.native_price_usd(chain).await;
+        for token in tokens {
+            if let Some(pair) = best_pair(chain, &pairs, token) {
+                if let Some(q) = self.build_quote_with_native(chain, token, pair, native_usd) {
+                    out.insert(token.to_lowercase(), q);
+                }
+            }
+        }
+        out
+    }
+
+    /// Build a TokenQuote from a chosen pair (single-token path).
+    async fn build_quote(&self, chain: &Chain, token: &str, pair: &DexPair) -> Option<TokenQuote> {
+        let native_usd = self.native_price_usd(chain).await;
+        self.build_quote_with_native(chain, token, pair, native_usd)
+    }
+
+    /// Shared quote construction (given the native/USD rate).
+    fn build_quote_with_native(
+        &self,
+        chain: &Chain,
+        token: &str,
+        best: &DexPair,
+        native_usd: f64,
+    ) -> Option<TokenQuote> {
         // Note: priceNative is quoted in the PAIR's quote token (WBNB, USDC, ...),
         // not necessarily the chain native coin — so always derive the native
         // price from USD (DexScreener's priceUsd) via the native/USD rate.
@@ -297,13 +389,25 @@ impl MarketData {
         Some(TokenQuote {
             address: token.to_string(),
             chain_id: chain.id.to_string(),
-            name: best.base_token.as_ref().and_then(|t| t.name.clone()).unwrap_or_else(|| short_addr(token)),
-            symbol: best.base_token.as_ref().and_then(|t| t.symbol.clone()).unwrap_or_else(|| short_addr(token)),
+            name: best
+                .base_token
+                .as_ref()
+                .and_then(|t| t.name.clone())
+                .unwrap_or_else(|| short_addr(token)),
+            symbol: best
+                .base_token
+                .as_ref()
+                .and_then(|t| t.symbol.clone())
+                .unwrap_or_else(|| short_addr(token)),
             price_usd,
             price_native,
             liquidity_usd: best.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0),
             volume_24h_usd: best.volume.as_ref().and_then(|v| v.h24).unwrap_or(0.0),
-            price_change_24h: best.price_change.as_ref().and_then(|c| c.h24).unwrap_or(0.0),
+            price_change_24h: best
+                .price_change
+                .as_ref()
+                .and_then(|c| c.h24)
+                .unwrap_or(0.0),
             fdv: best.fdv,
             pair_address: best.pair_address.clone(),
             dex: best.dex_id.clone(),
@@ -324,7 +428,9 @@ impl MarketData {
             }
         }
         let price = if self.live {
-            self.fetch_native_price(chain).await.unwrap_or(chain.fallback_native_usd)
+            self.fetch_native_price(chain)
+                .await
+                .unwrap_or(chain.fallback_native_usd)
         } else {
             chain.fallback_native_usd
         };
@@ -336,7 +442,10 @@ impl MarketData {
     }
 
     async fn fetch_native_price(&self, chain: &Chain) -> Option<f64> {
-        let url = format!("https://api.dexscreener.com/latest/dex/tokens/{}", chain.wrapped_native);
+        let url = format!(
+            "https://api.dexscreener.com/latest/dex/tokens/{}",
+            chain.wrapped_native
+        );
         let resp: DexPairsResponse = self.http.get(&url).send().await.ok()?.json().await.ok()?;
         let wn_lower = chain.wrapped_native.to_lowercase();
         resp.pairs
@@ -389,7 +498,10 @@ impl MarketData {
         } else {
             Vec::new()
         };
-        self.trending_cache.lock().unwrap().replace((Instant::now(), list.clone()));
+        self.trending_cache
+            .lock()
+            .unwrap()
+            .replace((Instant::now(), list.clone()));
         list
     }
 
@@ -494,7 +606,6 @@ pub fn short_addr(addr: &str) -> String {
     }
 }
 
-
 /// A token search hit (DexScreener /search).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
@@ -528,7 +639,15 @@ impl MarketData {
         let qq: String = q
             .trim()
             .chars()
-            .map(|c| if c == ' ' { "%20".to_string() } else if c.is_ascii_alphanumeric() { c.to_string() } else { String::new() })
+            .map(|c| {
+                if c == ' ' {
+                    "%20".to_string()
+                } else if c.is_ascii_alphanumeric() {
+                    c.to_string()
+                } else {
+                    String::new()
+                }
+            })
             .collect();
         if qq.is_empty() {
             return Vec::new();
@@ -539,16 +658,23 @@ impl MarketData {
             Err(_) => return Vec::new(),
         };
 
-        let mut seen: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+        let mut seen: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
         let mut out: Vec<SearchResult> = Vec::new();
         for p in resp.pairs {
             let Some(base) = &p.base_token else { continue };
-            let Some(address) = base.address.clone() else { continue };
+            let Some(address) = base.address.clone() else {
+                continue;
+            };
             let chain = p.chain_id.clone().unwrap_or_default();
             if chain.is_empty() {
                 continue;
             }
-            let price = p.price_usd.as_ref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            let price = p
+                .price_usd
+                .as_ref()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
             let liq = p.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0);
             let key = (chain.clone(), address.to_lowercase());
             let hit = SearchResult {
@@ -563,14 +689,18 @@ impl MarketData {
             };
             match seen.get(&key) {
                 Some(idx) if out[*idx].liquidity_usd < liq => out[*idx] = hit,
-                Some(_) => {},
+                Some(_) => {}
                 None => {
                     seen.insert(key, out.len());
                     out.push(hit);
                 }
             }
         }
-        out.sort_by(|a, b| b.liquidity_usd.partial_cmp(&a.liquidity_usd).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| {
+            b.liquidity_usd
+                .partial_cmp(&a.liquidity_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out.truncate(15);
         out
     }
@@ -631,9 +761,19 @@ mod tests {
         ]}"#;
         let resp: DexPairsResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.pairs.len(), 2);
-        let best = resp.pairs.iter().find(|p| p.chain_id.as_deref() == Some("bsc")).unwrap();
-        assert_eq!(best.pair_address.as_deref(), Some("0x1111111111111111111111111111111111111111"));
-        assert_eq!(best.txns.as_ref().unwrap().h24.as_ref().unwrap().buys, Some(1200));
+        let best = resp
+            .pairs
+            .iter()
+            .find(|p| p.chain_id.as_deref() == Some("bsc"))
+            .unwrap();
+        assert_eq!(
+            best.pair_address.as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            best.txns.as_ref().unwrap().h24.as_ref().unwrap().buys,
+            Some(1200)
+        );
         assert_eq!(best.liquidity.as_ref().unwrap().usd, Some(250000.0));
         assert_eq!(best.pair_created_at, Some(1712345678));
         assert_eq!(best.price_change.as_ref().unwrap().h24, Some(45.6));
@@ -646,7 +786,10 @@ mod tests {
         assert_eq!(format_usd(2_500_000.0), "$2.5M");
         assert_eq!(format_usd(500.0), "$500");
         assert_eq!(format_qty(0.0000000123), "0.00000001");
-        assert_eq!(short_addr("0xabcdef1234567890abcdef1234567890abcdef12"), "0xabcd…ef12");
+        assert_eq!(
+            short_addr("0xabcdef1234567890abcdef1234567890abcdef12"),
+            "0xabcd…ef12"
+        );
     }
 
     #[test]

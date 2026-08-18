@@ -287,7 +287,11 @@ pub async fn insert_order(conn: &Connection, o: &NewOrder<'_>) -> Result<i64> {
     )
     .await?;
     let mut rows = conn.query("SELECT last_insert_rowid()", ()).await?;
-    let id = rows.next().await?.context("order insert failed")?.get::<i64>(0)?;
+    let id = rows
+        .next()
+        .await?
+        .context("order insert failed")?
+        .get::<i64>(0)?;
     Ok(id)
 }
 
@@ -494,8 +498,14 @@ pub async fn insert_alert(
     )
     .await?;
     let mut rows = conn.query("SELECT last_insert_rowid()", ()).await?;
-    let id = rows.next().await?.context("alert insert failed")?.get::<i64>(0)?;
-    get_alert(conn, id).await?.context("alert not found after insert")
+    let id = rows
+        .next()
+        .await?
+        .context("alert insert failed")?
+        .get::<i64>(0)?;
+    get_alert(conn, id)
+        .await?
+        .context("alert not found after insert")
 }
 
 pub async fn get_alert(conn: &Connection, id: i64) -> Result<Option<Alert>> {
@@ -585,7 +595,6 @@ pub async fn get_setting(conn: &Connection, user_id: i64, key: &str) -> Result<O
         None => Ok(None),
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Background-worker helpers
@@ -726,4 +735,3 @@ pub async fn set_setting(conn: &Connection, user_id: i64, key: &str, value: &str
     .await?;
     Ok(())
 }
-

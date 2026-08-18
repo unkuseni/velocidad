@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::crypto::Keyring;
 use crate::db::Db;
 use crate::market::MarketData;
+use crate::rate::RateLimiter;
 use crate::rpc::RpcClient;
 use crate::security::TokenScanner;
 use crate::solana::SolanaClient;
@@ -22,6 +23,8 @@ pub struct AppState {
     pub solana: SolanaClient,
     pub keyring: Arc<Keyring>,
     pub config: Config,
+    pub bot_rate: Arc<RateLimiter>,
+    pub api_rate: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -39,13 +42,22 @@ impl AppState {
             ),
             solana: SolanaClient::new(parse_solana_sponsor(&config.sponsor_solana_key)),
             keyring: Arc::new(keyring),
+            bot_rate: Arc::new(RateLimiter::new(&[(
+                config.bot_rate_per_min,
+                std::time::Duration::from_secs(60),
+            )])),
+            api_rate: Arc::new(RateLimiter::new(&[(
+                config.api_rate_per_min,
+                std::time::Duration::from_secs(60),
+            )])),
             config,
         }
     }
 
     /// Resolve the user's default chain (falling back to config default).
     pub async fn user_chain(&self, user_id: i64) -> &'static crate::chains::Chain {
-        match crate::db::repo::user_chain(self.db.conn(), user_id, &self.config.default_chain).await {
+        match crate::db::repo::user_chain(self.db.conn(), user_id, &self.config.default_chain).await
+        {
             Ok(id) => crate::chains::by_id(&id).unwrap_or_else(|| default_chain(&self.config)),
             Err(_) => default_chain(&self.config),
         }
@@ -70,11 +82,12 @@ fn parse_solana_sponsor(key: &Option<String>) -> Option<crate::solana::SponsorCt
     if k.is_empty() {
         return None;
     }
-    let bytes = if k.starts_with("0x") || (k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit())) {
-        hex::decode(k.trim_start_matches("0x")).ok()?
-    } else {
-        bs58::decode(k).into_vec().ok()?
-    };
+    let bytes =
+        if k.starts_with("0x") || (k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit())) {
+            hex::decode(k.trim_start_matches("0x")).ok()?
+        } else {
+            bs58::decode(k).into_vec().ok()?
+        };
     let seed: [u8; 32] = match bytes.len() {
         32 => bytes.try_into().ok()?,
         64 => bytes[..32].try_into().ok()?,

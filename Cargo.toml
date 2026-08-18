@@ -50,6 +50,10 @@ rlp = "0.5"
 # RFC6979 deterministic ECDSA (HMAC-SHA256 DRBG)
 hmac = "0.12"
 
+# Constant-time comparisons (API key check) + secret zeroization
+subtle = "2"
+zeroize = "1"
+
 # Solana: ed25519 keypairs, base58 addresses, sha256 tx hashing
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 bs58 = "0.5"
@@ -61,3 +65,9 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Errors
 anyhow = "1"
+
+[lints.clippy]
+# Trading flows naturally take many parameters (state + chain + wallet +
+# amount + slippage + side...). Grouping them into structs would spread the
+# logic across files without reducing coupling.
+too_many_arguments = "allow"

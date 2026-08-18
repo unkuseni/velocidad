@@ -3,3 +3,8 @@ target
 velocidad.db
 velocidad.key
 *.log
+
+# Foundry (contracts/) artifacts — CI clones forge-std itself
+contracts/out/
+contracts/cache/
+contracts/lib/

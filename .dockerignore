@@ -1,0 +1,10 @@
+target
+.git
+.env
+velocidad.db
+velocidad.key
+*.log
+contracts/out
+contracts/cache
+contracts/lib
+.github

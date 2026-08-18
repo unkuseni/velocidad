@@ -4,6 +4,7 @@
 //! - **alert poller** — checks untriggered price alerts against live quotes
 //!   and notifies users when they fire.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +35,7 @@ async fn limit_matcher(state: Arc<AppState>, bot: Bot) {
         interval.tick().await;
         match match_limits(&state, &bot).await {
             Ok(n) if n > 0 => tracing::info!(filled = n, "limit orders filled"),
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "limit matcher error"),
         }
     }
@@ -45,16 +46,27 @@ async fn match_limits(state: &AppState, bot: &Bot) -> anyhow::Result<usize> {
     if orders.is_empty() {
         return Ok(0);
     }
+    // One batched DexScreener request per chain instead of one per order.
+    let items: Vec<(String, String)> = orders
+        .iter()
+        .map(|o| (o.network.clone(), o.token_address.clone()))
+        .collect();
+    let quotes = batch_quotes(state, &items).await;
     let mut filled = 0;
     for order in orders {
         let Some(chain) = chains::by_id(&order.network) else {
             tracing::warn!(network = %order.network, "unknown chain on limit order — skipping");
             continue;
         };
-        let quote = state.market.quote(chain, &order.token_address).await;
+        let Some(quote) = quotes.get(&(order.network.clone(), order.token_address.to_lowercase()))
+        else {
+            tracing::warn!(network = %order.network, token = %order.token_address, "no quote for limit order token — skipping");
+            continue;
+        };
         let price = quote.price_native;
         let limit_price = order.price.unwrap_or(0.0);
-        if limit_price <= 0.0 || price > limit_price {
+        // Zero/unpriced tokens must never satisfy a trigger.
+        if limit_price <= 0.0 || price <= 0.0 || price > limit_price {
             continue;
         }
 
@@ -62,8 +74,8 @@ async fn match_limits(state: &AppState, bot: &Bot) -> anyhow::Result<usize> {
             Ok(receipt) => {
                 filled += 1;
                 notify(
-                    &bot,
-                    &state,
+                    bot,
+                    state,
                     order.user_id,
                     format!(
                         "⏳ <b>LIMIT ORDER FILLED</b>\n\nToken: <code>{}</code> ({})\nBuy at: <b>{}</b> (filled {})\nQty: <b>{}</b>\nSpent: <b>{:.6} {}</b>\n{}\n\n{}",
@@ -102,12 +114,22 @@ async fn alert_poller(state: Arc<AppState>, bot: Bot) {
 async fn poll_alerts(state: &AppState, bot: &Bot) -> anyhow::Result<usize> {
     let alerts = repo::list_untriggered_alerts(state.db.conn()).await?;
     let mut fired = 0;
+    // One batched DexScreener request per chain instead of one per alert.
+    let items: Vec<(String, String)> = alerts
+        .iter()
+        .map(|a| (a.network.clone(), a.token_address.clone()))
+        .collect();
+    let quotes = batch_quotes(state, &items).await;
     for alert in alerts {
-        let Some(chain) = chains::by_id(&alert.network) else {
+        let Some(quote) = quotes.get(&(alert.network.clone(), alert.token_address.to_lowercase()))
+        else {
             continue;
         };
-        let quote = state.market.quote(chain, &alert.token_address).await;
         let price = quote.price_native;
+        // Guard against zero-price simulator garbage triggering "below" alerts.
+        if price <= 0.0 {
+            continue;
+        }
         let hit = match alert.condition.as_str() {
             "above" => price >= alert.target_price,
             "below" => price <= alert.target_price,
@@ -137,9 +159,36 @@ async fn poll_alerts(state: &AppState, bot: &Bot) -> anyhow::Result<usize> {
     Ok(fired)
 }
 
+/// Fetch quotes for a set of (network, token) pairs with one request per chain.
+async fn batch_quotes(
+    state: &AppState,
+    items: &[(String, String)],
+) -> HashMap<(String, String), crate::market::TokenQuote> {
+    let mut by_chain: HashMap<String, Vec<String>> = HashMap::new();
+    for (network, token) in items {
+        let entry = by_chain.entry(network.clone()).or_default();
+        let lower = token.to_lowercase();
+        if !entry.contains(&lower) {
+            entry.push(lower);
+        }
+    }
+    let mut out = HashMap::new();
+    for (network, tokens) in by_chain {
+        let Some(chain) = chains::by_id(&network) else {
+            continue;
+        };
+        for (token, quote) in state.market.quotes_batch(chain, &tokens).await {
+            out.insert((network.clone(), token), quote);
+        }
+    }
+    out
+}
+
 /// Escape a string for Telegram HTML messages.
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Send a Telegram notification to a user; failures are logged, not fatal.

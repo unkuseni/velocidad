@@ -40,7 +40,7 @@ pub struct JupiterQuote {
 }
 
 /// Result of a live Solana swap.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SolanaTradeResult {
     pub tx_signature: String,
     pub success: bool,
@@ -49,7 +49,6 @@ pub struct SolanaTradeResult {
     pub price_native: f64,
     pub explorer_link: String,
 }
-
 
 /// Sponsor context: seed + derived pubkey.
 #[derive(Debug, Clone, Copy)]
@@ -62,7 +61,10 @@ impl SponsorCtx {
     pub fn from_seed(seed: [u8; 32]) -> Self {
         use ed25519_dalek::SigningKey;
         let sk = SigningKey::from_bytes(&seed);
-        Self { seed, pubkey: sk.verifying_key().to_bytes() }
+        Self {
+            seed,
+            pubkey: sk.verifying_key().to_bytes(),
+        }
     }
 
     pub fn address(&self) -> String {
@@ -152,7 +154,12 @@ impl SolanaClient {
                 let decimals = ta.get("decimals").and_then(|d| d.as_u64()).unwrap_or(0) as u8;
                 let amount = ta.get("uiAmount").and_then(|a| a.as_f64()).unwrap_or(0.0);
                 if amount > 0.0 {
-                    out.push(SolBalance { mint, account, amount, decimals });
+                    out.push(SolBalance {
+                        mint,
+                        account,
+                        amount,
+                        decimals,
+                    });
                 }
             }
         }
@@ -161,7 +168,13 @@ impl SolanaClient {
 
     /// Latest blockhash (32 raw bytes) for message construction.
     pub async fn latest_blockhash(&self, chain: &Chain) -> Result<[u8; 32]> {
-        let v = self.rpc(chain, "getLatestBlockhash", json!([{ "commitment": "processed" }])).await?;
+        let v = self
+            .rpc(
+                chain,
+                "getLatestBlockhash",
+                json!([{ "commitment": "processed" }]),
+            )
+            .await?;
         let bh = v
             .pointer("/value/blockhash")
             .and_then(|b| b.as_str())
@@ -215,7 +228,10 @@ impl SolanaClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            bail!("Jupiter quote failed ({status}): {}", text.chars().take(300).collect::<String>());
+            bail!(
+                "Jupiter quote failed ({status}): {}",
+                text.chars().take(300).collect::<String>()
+            );
         }
         let raw: Value = serde_json::from_str(&text)?;
         let in_amount: u64 = raw
@@ -242,7 +258,11 @@ impl SolanaClient {
     }
 
     /// Build the unsigned swap transaction (base64) for a quote.
-    pub async fn swap_transaction(&self, quote: &JupiterQuote, user_pubkey: &str) -> Result<String> {
+    pub async fn swap_transaction(
+        &self,
+        quote: &JupiterQuote,
+        user_pubkey: &str,
+    ) -> Result<String> {
         let body = json!({
             "quoteResponse": quote.raw,
             "userPublicKey": user_pubkey,
@@ -250,11 +270,19 @@ impl SolanaClient {
             "dynamicComputeUnitLimit": true,
             "prioritizationFeeLamports": PRIORITIZATION_FEE_LAMPORTS,
         });
-        let resp = self.http.post("https://quote-api.jup.ag/v6/swap").json(&body).send().await?;
+        let resp = self
+            .http
+            .post("https://quote-api.jup.ag/v6/swap")
+            .json(&body)
+            .send()
+            .await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            bail!("Jupiter swap tx failed ({status}): {}", text.chars().take(300).collect::<String>());
+            bail!(
+                "Jupiter swap tx failed ({status}): {}",
+                text.chars().take(300).collect::<String>()
+            );
         }
         let v: Value = serde_json::from_str(&text)?;
         v.get("swapTransaction")
@@ -271,7 +299,9 @@ impl SolanaClient {
         use ed25519_dalek::{Signer, SigningKey};
         use sha2::{Digest, Sha256};
 
-        let bytes = B64.decode(base64_tx.trim()).context("invalid base64 transaction")?;
+        let bytes = B64
+            .decode(base64_tx.trim())
+            .context("invalid base64 transaction")?;
         let (count, count_len) = decode_short_u16(&bytes).context("invalid signature count")?;
         if count != 1 {
             bail!("expected a single-signer transaction, got {count} signers");
@@ -311,7 +341,10 @@ impl SolanaClient {
     pub async fn wait_confirmation(&self, chain: &Chain, sig: &str) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(45);
         loop {
-            if let Ok(v) = self.rpc(chain, "getSignatureStatuses", json!([[sig]])).await {
+            if let Ok(v) = self
+                .rpc(chain, "getSignatureStatuses", json!([[sig]]))
+                .await
+            {
                 if let Some(status) = v.pointer("/value/0") {
                     if let Some(err) = status.get("err") {
                         if !err.is_null() {
@@ -348,7 +381,8 @@ impl SolanaClient {
         if lamports == 0 {
             bail!("amount too small for a live swap");
         }
-        self.swap_flow(chain, WSOL, mint, lamports, slippage, wallet, seed, sponsor).await
+        self.swap_flow(chain, WSOL, mint, lamports, slippage, wallet, seed, sponsor)
+            .await
     }
 
     /// Live sell: swap a token quantity for SOL.
@@ -370,7 +404,8 @@ impl SolanaClient {
         if amount == 0 {
             bail!("quantity too small for token decimals");
         }
-        self.swap_flow(chain, mint, WSOL, amount, slippage, wallet, seed, sponsor).await
+        self.swap_flow(chain, mint, WSOL, amount, slippage, wallet, seed, sponsor)
+            .await
     }
 
     /// Shared swap pipeline: quote → swap tx → sign → broadcast → confirm.
@@ -394,8 +429,12 @@ impl SolanaClient {
         let signed = match sponsor {
             Some(sp) => {
                 // Rebuild with the sponsor as fee payer; dual-sign (sponsor + owner).
-                let owner = bs58::decode(wallet.trim()).into_vec().context("bad wallet pubkey")?;
-                let owner: [u8; 32] = owner.try_into().map_err(|_| anyhow::anyhow!("wallet pubkey must be 32 bytes"))?;
+                let owner = bs58::decode(wallet.trim())
+                    .into_vec()
+                    .context("bad wallet pubkey")?;
+                let owner: [u8; 32] = owner
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("wallet pubkey must be 32 bytes"))?;
                 let (message, signers) = rebuild_with_sponsor_payer(&tx_b64, &sp.pubkey, &owner)?;
                 let mut sigs = Vec::with_capacity(signers.len());
                 for s in &signers {
@@ -426,124 +465,6 @@ impl Default for SolanaClient {
         Self::new(None)
     }
 }
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn short_u16_roundtrip() {
-        assert_eq!(decode_short_u16(&[0x01, 0x00]).unwrap(), (1, 1));
-        assert_eq!(decode_short_u16(&[0x7f]).unwrap(), (127, 1));
-        assert_eq!(decode_short_u16(&[0x80, 0x01]).unwrap(), (128, 2));
-        assert_eq!(decode_short_u16(&[0xac, 0x02]).unwrap(), (300, 2));
-        assert!(decode_short_u16(&[]).is_err());
-    }
-
-    #[test]
-    fn signs_a_known_transaction() {
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine;
-        // Hand-built single-signer tx: count=1, placeholder 64-byte signature,
-        // then a trivial message. Signing must be deterministic.
-        let message = [0x02u8, 0x03, 0x04, 0x05];
-        let mut tx = Vec::new();
-        tx.push(0x01);
-        tx.extend_from_slice(&[0u8; 64]);
-        tx.extend_from_slice(&message);
-        let b64 = B64.encode(&tx);
-
-        let seed = [7u8; 32];
-        let signed = SolanaClient::sign_transaction(&b64, &seed).unwrap();
-        let raw = B64.decode(&signed).unwrap();
-        assert_eq!(raw[0], 0x01); // still one signer
-        assert_eq!(raw.len(), 1 + 64 + message.len());
-        assert_eq!(&raw[65..], &message); // message intact
-        // Signature must verify against the derived pubkey.
-        use ed25519_dalek::{Signature as EdSig, Verifier, VerifyingKey};
-        use sha2::{Digest, Sha256};
-        let hash = Sha256::digest(&message);
-        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-        let pk = VerifyingKey::from(&sk);
-        let sig = EdSig::from_slice(&raw[1..65]).unwrap();
-        assert!(pk.verify(&hash, &sig).is_ok());
-        // Deterministic across calls.
-        let again = SolanaClient::sign_transaction(&b64, &seed).unwrap();
-        assert_eq!(signed, again);
-    }
-
-
-    /// Golden fixture generated with @solana/web3.js: a 1-signer transfer tx
-    /// (owner=seed 1, payer=owner, fixed blockhash). We rebuild it with the
-    /// sponsor (seed 2) as fee payer, dual-sign, and assert the exact result
-    /// — cross-checked against Transaction.from() in node.
-    #[test]
-    fn sponsor_payer_rebuild_golden() {
-        let owner_seed = [1u8; 32];
-        let sponsor_seed = [2u8; 32];
-        let owner_pub = ed25519_dalek::SigningKey::from_bytes(&owner_seed).verifying_key().to_bytes();
-        let sponsor_pub = ed25519_dalek::SigningKey::from_bytes(&sponsor_seed).verifying_key().to_bytes();
-        assert_eq!(bs58::encode(owner_pub).into_string(), "AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9");
-        assert_eq!(bs58::encode(sponsor_pub).into_string(), "9hSR6S7WPtxmTojgo6GG3k4yDPecgJY292j7xrsUGWBu");
-
-        let tx_b64 = "AcCnDmXG96o+yad9kYHR/4BKMpqsc8Unmz5tcktAo6ixdnO/yUuC0Ovx07Tn8ZxsWogpxjz23q48wBRzMKasAwIBAAEDiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1y6MKHN0adBINpOyUwdPqR+WjQqzYisKrPZfLTwitxUvgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASdwXDTUzpIWq6tYjZnZ+XQKEn5uCAMh2KqupFG63KfsBAgIAAQwCAAAAOTAAAAAAAAA=";
-        let (message, signers) = rebuild_with_sponsor_payer(tx_b64, &sponsor_pub, &owner_pub).unwrap();
-        assert_eq!(signers.len(), 2);
-        assert_eq!(signers[0], sponsor_pub);
-        assert_eq!(signers[1], owner_pub);
-        // message[0] = 2 signatures now
-        assert_eq!(message[0], 2);
-        // first two keys in the message = sponsor, then owner
-        assert_eq!(&message[3 + 1..3 + 1 + 32], &sponsor_pub[..]);
-        assert_eq!(&message[3 + 1 + 32..3 + 1 + 64], &owner_pub[..]);
-
-        let sigs: Vec<Vec<u8>> = signers
-            .iter()
-            .map(|s| {
-                let seed = if *s == sponsor_pub { sponsor_seed } else { owner_seed };
-                sign_message(&message, &seed)
-            })
-            .collect();
-        let assembled = assemble_transaction(&message, &sigs).unwrap();
-        // Deterministic across runs.
-        let again = assemble_transaction(&message, &sigs).unwrap();
-        assert_eq!(assembled, again);
-        // Decode: count byte, 2 sigs, message intact.
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine;
-        let raw = B64.decode(&assembled).unwrap();
-        assert_eq!(raw[0], 2);
-        assert_eq!(raw.len(), 1 + 128 + message.len());
-        assert_eq!(&raw[129..], &message[..]);
-        // 64-byte signatures.
-        assert_eq!(&raw[1..65], &sigs[0][..]);
-        assert_eq!(&raw[65..129], &sigs[1][..]);
-        eprintln!("ASSEMBLED={assembled}");
-    }
-
-    #[test]
-    fn parses_jupiter_quote_fixture() {
-        let json = r#"{"inputMint": "So11111111111111111111111111111111111111112",
-          "inAmount": "1000000",
-          "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-          "outAmount": "752398",
-          "otherAmountThreshold": "746015",
-          "swapMode": "ExactIn",
-          "slippageBps": 300,
-          "priceImpactPct": "0.12",
-          "routePlan": [],
-          "contextSlot": 1
-        }"#;
-        let raw: Value = serde_json::from_str(json).unwrap();
-        // exercise the same extraction logic
-        let in_amount: u64 = raw.get("inAmount").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap();
-        let out_amount: u64 = raw.get("outAmount").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap();
-        assert_eq!(in_amount, 1_000_000);
-        assert_eq!(out_amount, 752_398);
-    }
-}
-
 
 // ---------------------------------------------------------------------------
 // Gas-fee sponsorship & token delegation
@@ -593,7 +514,8 @@ pub fn parse_message(msg: &[u8]) -> Result<SolanaMessage> {
         let (nacc, ap) = decode_short_u16(&msg[pos + 1..]).context("instruction accounts")?;
         let acc_start = pos + 1 + ap;
         let acc_bytes = nacc as usize;
-        let (ndata, dp) = decode_short_u16(&msg[acc_start + acc_bytes..]).context("instruction data")?;
+        let (ndata, dp) =
+            decode_short_u16(&msg[acc_start + acc_bytes..]).context("instruction data")?;
         let data_start = acc_start + acc_bytes + dp;
         let data_bytes = ndata as usize;
         if msg.len() < data_start + data_bytes {
@@ -608,7 +530,12 @@ pub fn parse_message(msg: &[u8]) -> Result<SolanaMessage> {
         instructions.push(blob);
         pos = data_start + data_bytes;
     }
-    Ok(SolanaMessage { header, keys, blockhash, instructions })
+    Ok(SolanaMessage {
+        header,
+        keys,
+        blockhash,
+        instructions,
+    })
 }
 
 fn encode_short_u16(v: u16, out: &mut Vec<u8>) {
@@ -647,7 +574,9 @@ pub fn rebuild_with_sponsor_payer(
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
 
-    let bytes = B64.decode(base64_tx.trim()).context("invalid base64 transaction")?;
+    let bytes = B64
+        .decode(base64_tx.trim())
+        .context("invalid base64 transaction")?;
     let (count, count_len) = decode_short_u16(&bytes).context("signature count")?;
     let msg_start = count_len + 64 * count as usize;
     let mut m = parse_message(&bytes[msg_start..])?;
@@ -721,7 +650,13 @@ pub fn sign_message(message: &[u8], seed: &[u8; 32]) -> Vec<u8> {
 }
 
 /// SPL-token Approve instruction blob (variant 4).
-fn approve_instruction(program_idx: u8, source_idx: u8, delegate_idx: u8, owner_idx: u8, amount: u64) -> Vec<u8> {
+fn approve_instruction(
+    program_idx: u8,
+    source_idx: u8,
+    delegate_idx: u8,
+    owner_idx: u8,
+    amount: u64,
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(program_idx);
     encode_short_u16(3, &mut out);
@@ -757,12 +692,18 @@ pub fn build_sponsored_approve(
     blockhash: &[u8; 32],
 ) -> (Vec<u8>, Vec<[u8; 32]>) {
     const TOKEN_PROGRAM: [u8; 32] = [
-        6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133, 237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+        6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133,
+        237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
     ];
-    let keys = vec![*sponsor, *owner, TOKEN_PROGRAM, *source_token_account, *delegate];
+    let keys = vec![
+        *sponsor,
+        *owner,
+        TOKEN_PROGRAM,
+        *source_token_account,
+        *delegate,
+    ];
     let header = [2u8, 0, 2];
-    let mut instructions = Vec::new();
-    instructions.push(approve_instruction(2, 3, 4, 1, amount));
+    let instructions = vec![approve_instruction(2, 3, 4, 1, amount)];
     let m = SolanaMessage {
         header,
         keys: keys.clone(),
@@ -780,12 +721,12 @@ pub fn build_sponsored_revoke(
     blockhash: &[u8; 32],
 ) -> (Vec<u8>, Vec<[u8; 32]>) {
     const TOKEN_PROGRAM: [u8; 32] = [
-        6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133, 237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+        6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133,
+        237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
     ];
     let keys = vec![*sponsor, *owner, TOKEN_PROGRAM, *source_token_account];
     let header = [2u8, 0, 2];
-    let mut instructions = Vec::new();
-    instructions.push(revoke_instruction(2, 3, 1));
+    let instructions = vec![revoke_instruction(2, 3, 1)];
     let m = SolanaMessage {
         header,
         keys: keys.clone(),
@@ -803,5 +744,143 @@ fn decode_short_u16(bytes: &[u8]) -> Result<(u16, usize)> {
     } else {
         let b1 = *bytes.get(1).context("short compact-u16")?;
         Ok((((b0 as u16 & 0x7f) | ((b1 as u16) << 7)), 2))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_u16_roundtrip() {
+        assert_eq!(decode_short_u16(&[0x01, 0x00]).unwrap(), (1, 1));
+        assert_eq!(decode_short_u16(&[0x7f]).unwrap(), (127, 1));
+        assert_eq!(decode_short_u16(&[0x80, 0x01]).unwrap(), (128, 2));
+        assert_eq!(decode_short_u16(&[0xac, 0x02]).unwrap(), (300, 2));
+        assert!(decode_short_u16(&[]).is_err());
+    }
+
+    #[test]
+    fn signs_a_known_transaction() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+        // Hand-built single-signer tx: count=1, placeholder 64-byte signature,
+        // then a trivial message. Signing must be deterministic.
+        let message = [0x02u8, 0x03, 0x04, 0x05];
+        let mut tx = Vec::new();
+        tx.push(0x01);
+        tx.extend_from_slice(&[0u8; 64]);
+        tx.extend_from_slice(&message);
+        let b64 = B64.encode(&tx);
+
+        let seed = [7u8; 32];
+        let signed = SolanaClient::sign_transaction(&b64, &seed).unwrap();
+        let raw = B64.decode(&signed).unwrap();
+        assert_eq!(raw[0], 0x01); // still one signer
+        assert_eq!(raw.len(), 1 + 64 + message.len());
+        assert_eq!(&raw[65..], &message); // message intact
+                                          // Signature must verify against the derived pubkey.
+        use ed25519_dalek::{Signature as EdSig, Verifier, VerifyingKey};
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(message);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let pk = VerifyingKey::from(&sk);
+        let sig = EdSig::from_slice(&raw[1..65]).unwrap();
+        assert!(pk.verify(&hash, &sig).is_ok());
+        // Deterministic across calls.
+        let again = SolanaClient::sign_transaction(&b64, &seed).unwrap();
+        assert_eq!(signed, again);
+    }
+
+    /// Golden fixture generated with @solana/web3.js: a 1-signer transfer tx
+    /// (owner=seed 1, payer=owner, fixed blockhash). We rebuild it with the
+    /// sponsor (seed 2) as fee payer, dual-sign, and assert the exact result
+    /// — cross-checked against Transaction.from() in node.
+    #[test]
+    fn sponsor_payer_rebuild_golden() {
+        let owner_seed = [1u8; 32];
+        let sponsor_seed = [2u8; 32];
+        let owner_pub = ed25519_dalek::SigningKey::from_bytes(&owner_seed)
+            .verifying_key()
+            .to_bytes();
+        let sponsor_pub = ed25519_dalek::SigningKey::from_bytes(&sponsor_seed)
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(
+            bs58::encode(owner_pub).into_string(),
+            "AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9"
+        );
+        assert_eq!(
+            bs58::encode(sponsor_pub).into_string(),
+            "9hSR6S7WPtxmTojgo6GG3k4yDPecgJY292j7xrsUGWBu"
+        );
+
+        let tx_b64 = "AcCnDmXG96o+yad9kYHR/4BKMpqsc8Unmz5tcktAo6ixdnO/yUuC0Ovx07Tn8ZxsWogpxjz23q48wBRzMKasAwIBAAEDiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1y6MKHN0adBINpOyUwdPqR+WjQqzYisKrPZfLTwitxUvgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASdwXDTUzpIWq6tYjZnZ+XQKEn5uCAMh2KqupFG63KfsBAgIAAQwCAAAAOTAAAAAAAAA=";
+        let (message, signers) =
+            rebuild_with_sponsor_payer(tx_b64, &sponsor_pub, &owner_pub).unwrap();
+        assert_eq!(signers.len(), 2);
+        assert_eq!(signers[0], sponsor_pub);
+        assert_eq!(signers[1], owner_pub);
+        // message[0] = 2 signatures now
+        assert_eq!(message[0], 2);
+        // first two keys in the message = sponsor, then owner
+        assert_eq!(&message[3 + 1..3 + 1 + 32], &sponsor_pub[..]);
+        assert_eq!(&message[3 + 1 + 32..3 + 1 + 64], &owner_pub[..]);
+
+        let sigs: Vec<Vec<u8>> = signers
+            .iter()
+            .map(|s| {
+                let seed = if *s == sponsor_pub {
+                    sponsor_seed
+                } else {
+                    owner_seed
+                };
+                sign_message(&message, &seed)
+            })
+            .collect();
+        let assembled = assemble_transaction(&message, &sigs).unwrap();
+        // Deterministic across runs.
+        let again = assemble_transaction(&message, &sigs).unwrap();
+        assert_eq!(assembled, again);
+        // Decode: count byte, 2 sigs, message intact.
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+        let raw = B64.decode(&assembled).unwrap();
+        assert_eq!(raw[0], 2);
+        assert_eq!(raw.len(), 1 + 128 + message.len());
+        assert_eq!(&raw[129..], &message[..]);
+        // 64-byte signatures.
+        assert_eq!(&raw[1..65], &sigs[0][..]);
+        assert_eq!(&raw[65..129], &sigs[1][..]);
+        eprintln!("ASSEMBLED={assembled}");
+    }
+
+    #[test]
+    fn parses_jupiter_quote_fixture() {
+        let json = r#"{"inputMint": "So11111111111111111111111111111111111111112",
+          "inAmount": "1000000",
+          "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+          "outAmount": "752398",
+          "otherAmountThreshold": "746015",
+          "swapMode": "ExactIn",
+          "slippageBps": 300,
+          "priceImpactPct": "0.12",
+          "routePlan": [],
+          "contextSlot": 1
+        }"#;
+        let raw: Value = serde_json::from_str(json).unwrap();
+        // exercise the same extraction logic
+        let in_amount: u64 = raw
+            .get("inAmount")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap();
+        let out_amount: u64 = raw
+            .get("outAmount")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap();
+        assert_eq!(in_amount, 1_000_000);
+        assert_eq!(out_amount, 752_398);
     }
 }

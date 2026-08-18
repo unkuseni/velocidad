@@ -56,7 +56,8 @@ pub fn sign_hash(hash: &[u8; 32], secret: &[u8; 32]) -> Result<(u64, Vec<u8>, Ve
 
     // Deterministic ephemeral key: RFC6979 with h1 = hash (no re-hash).
     let k = rfc6979_k(secret, hash)?;
-    let kinv = Option::<Scalar>::from(k.invert()).ok_or_else(|| anyhow::anyhow!("k not invertible"))?;
+    let kinv =
+        Option::<Scalar>::from(k.invert()).ok_or_else(|| anyhow::anyhow!("k not invertible"))?;
 
     let r_point = ProjectivePoint::GENERATOR * k;
     let aff = r_point.to_affine();
@@ -68,11 +69,12 @@ pub fn sign_hash(hash: &[u8; 32], secret: &[u8; 32]) -> Result<(u64, Vec<u8>, Ve
     let mut s = kinv * zr;
     // Normalize s (EIP-2 low-s). Normalizing flips the signature point to
     // -R, so the y-parity must flip along with it.
-    let half_n_bytes: [u8; 32] = hex::decode("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("bad n/2"))?;
+    let half_n_bytes: [u8; 32] =
+        hex::decode("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0")?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("bad n/2"))?;
     let half_n = Option::<Scalar>::from(Scalar::from_repr(half_n_bytes.into())).unwrap();
-    let flipped = bool::from(s > half_n);
+    let flipped = s > half_n;
     if flipped {
         s = Scalar::ZERO - s;
     }
@@ -88,8 +90,8 @@ pub fn sign_hash(hash: &[u8; 32], secret: &[u8; 32]) -> Result<(u64, Vec<u8>, Ve
 /// RFC6979 (HMAC-SHA256 DRBG) ephemeral scalar for secp256k1, with the
 /// digest used directly as h1 (matching @noble/curves).
 fn rfc6979_k(secret: &[u8; 32], z: &[u8; 32]) -> Result<Scalar> {
-    use k256::Scalar;
     use hmac::{Hmac, Mac};
+    use k256::Scalar;
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;
@@ -138,7 +140,10 @@ fn rfc6979_k(secret: &[u8; 32], z: &[u8; 32]) -> Result<Scalar> {
 }
 
 /// Sign the EIP-7702 authorization digest.
-pub fn sign_authorization(auth: &Authorization, secret: &[u8; 32]) -> Result<(u64, Vec<u8>, Vec<u8>)> {
+pub fn sign_authorization(
+    auth: &Authorization,
+    secret: &[u8; 32],
+) -> Result<(u64, Vec<u8>, Vec<u8>)> {
     let address = crate::swap::decode_address(&auth.address)?;
     let mut stream = rlp::RlpStream::new_list(3);
     stream.append(&auth.chain_id);
@@ -280,18 +285,17 @@ mod tests {
                 nonce: 0,
             }),
         };
-        let secret: [u8; 32] = hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
-            .unwrap()
-            .try_into()
-            .unwrap();
+        let secret: [u8; 32] =
+            hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap()
+                .try_into()
+                .unwrap();
         let raw = sign_7702(&tx, &secret).unwrap();
         assert_eq!(
             raw,
             "0x04f8c90180843b9aca008502540be4008252089435353535353535353535353535353535353535358080c0f85cf85a019435353535353535353535353535353535353535358080a0daaed828509b2565fd21022336ed828408b07706cfca416d67304b6a68a44d5da02a30e775229d38755f04890cac2ecf1fce06c3038ea1a401c3e73382209d47f080a081ac3c2fcbe6a8f9458a071cb09892c95b384c4245fc818f3730559b614ccb81a021bf7b5a608b4e601d752bf07ef618a7a3789773300ca9900e7640343640bb83"
         );
     }
-
-
 
     #[test]
     fn execute_calldata_layout() {
@@ -302,7 +306,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&data[0..4], &[0x1c, 0xff, 0x79, 0xcd]);
-        assert_eq!(&data[16..36], &hex::decode("1234567890abcdef1234567890abcdef12345678").unwrap()[..]);
+        assert_eq!(
+            &data[16..36],
+            &hex::decode("1234567890abcdef1234567890abcdef12345678").unwrap()[..]
+        );
         assert_eq!(&data[64..68], &[0u8, 0, 0, 5]);
     }
 }
