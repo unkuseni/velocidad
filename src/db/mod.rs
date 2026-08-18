@@ -110,6 +110,19 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (user_id, key)
     );
     "#,
+    // Alerts are chain-scoped (multi-chain support)
+    r#"
+    ALTER TABLE alerts ADD COLUMN network TEXT NOT NULL DEFAULT 'ethereum';
+    "#,
+    // Indexes for the background workers
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_orders_pending_limit
+        ON orders (status, side) WHERE status = 'pending' AND side = 'limit';
+    "#,
+    r#"
+    CREATE INDEX IF NOT EXISTS idx_alerts_untriggered
+        ON alerts (is_triggered);
+    "#,
 ];
 
 /// Shared handle to the libSQL database. Cheap to clone (`Connection` is

@@ -78,6 +78,7 @@ pub struct Position {
 pub struct Alert {
     pub id: i64,
     pub user_id: i64,
+    pub network: String,
     pub token_address: String,
     pub condition: String,
     pub target_price: f64,

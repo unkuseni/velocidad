@@ -21,12 +21,12 @@ impl Default for RiskManager {
 }
 
 impl RiskManager {
-    pub fn validate_trade(&self, token_address: &str, amount: f64, slippage: f64) -> Result<()> {
+    pub fn validate_trade(&self, token_address: &str, amount: f64, slippage: f64, native: &str) -> Result<()> {
         if amount <= 0.0 {
             bail!("amount must be positive");
         }
         if amount > self.max_order_eth {
-            bail!("order exceeds max size of {} ETH", self.max_order_eth);
+            bail!("order exceeds max size of {} {}", self.max_order_eth, native);
         }
         if slippage < 0.0 || slippage > self.max_slippage {
             bail!("slippage must be between 0 and {}%", self.max_slippage * 100.0);

@@ -1,23 +1,22 @@
-//! Trading engine.
+//! Trading engine — chain-aware order execution against the market feed.
 //!
-//! In **paper-trading mode** (the default) every order is filled immediately
-//! against a deterministic mock market, so the whole system — Telegram bot,
-//! API, portfolio accounting, alerts — works end-to-end without any RPC nodes.
-//! Swap the `MarketSimulator` for a real DEX/RPC integration later; the rest of
-//! the pipeline (risk checks → fill → position accounting → alert checks →
-//! order record) stays identical.
+//! Prices come from the shared [`MarketData`] (DexScreener with a simulator
+//! fallback), so the same engine powers paper trading with real prices and,
+//! once `ZEROEX_API_KEY` is configured, live swaps signed by [`crate::swap`].
+
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use libsql::Connection;
 use serde::Serialize;
 
+use crate::chains::Chain;
 use crate::db::models::Order;
 use crate::db::{repo, Db};
+use crate::market::MarketData;
 
-pub mod market;
 pub mod risk;
 
-pub use market::MarketSimulator;
 pub use risk::RiskManager;
 
 /// Result of a filled order, ready to be rendered to the user.
@@ -29,50 +28,60 @@ pub struct TradeReceipt {
     pub position_avg_price: f64,
     pub realized_pnl: Option<f64>,
     pub alerts_fired: i64,
+    /// `"paper"` for simulated fills, or the real tx hash for live swaps.
+    pub tx_ref: String,
+    /// Explorer link for live swaps.
+    pub explorer_link: Option<String>,
 }
 
 pub struct TradingEngine {
-    pub sim: MarketSimulator,
+    pub market: Arc<MarketData>,
     pub risk: RiskManager,
 }
 
 impl TradingEngine {
-    pub fn new() -> Self {
+    pub fn new(market: Arc<MarketData>) -> Self {
         Self {
-            sim: MarketSimulator::new(),
+            market,
             risk: RiskManager::default(),
         }
     }
 
-    /// Execute a market buy (or snipe) at the current simulated price.
+    /// Execute a market buy (or snipe) at the current price on `chain`.
     ///
-    /// `side` must be `"buy"` or `"snipe"` — both fill identically in paper mode.
+    /// `amount_native` is the spend in the chain's native coin (ETH/BNB/…).
     pub async fn buy(
         &self,
         db: &Db,
+        chain: &Chain,
         user_id: i64,
         wallet_id: Option<i64>,
         token_address: &str,
-        amount_in: f64,
+        amount_native: f64,
         slippage: f64,
         side: &str,
     ) -> Result<TradeReceipt> {
-        self.risk.validate_trade(token_address, amount_in, slippage)?;
+        self.risk.validate_trade(token_address, amount_native, slippage, chain.native)?;
 
-        let price = self.sim.price(token_address);
-        let quantity = amount_in / price;
+        let quote = self.market.quote(chain, token_address).await;
+        let price = quote.price_native;
+        if price <= 0.0 {
+            bail!("no valid price for this token on {}", chain.id);
+        }
+        let quantity = amount_native / price;
 
         let conn = db.conn();
         let tx = conn.transaction().await?;
-        repo::add_to_position(&tx, user_id, wallet_id, token_address, quantity, price).await?;
+        repo::add_to_position(&tx, user_id, wallet_id, chain.id, token_address, quantity, price).await?;
         let order_id = repo::insert_order(
             &tx,
             &repo::NewOrder {
                 user_id,
                 wallet_id,
+                network: chain.id,
                 token_address,
                 side,
-                amount_in: Some(amount_in),
+                amount_in: Some(amount_native),
                 amount_out: Some(quantity),
                 price: Some(price),
                 slippage,
@@ -93,22 +102,27 @@ impl TradingEngine {
             })
     }
 
-    /// Execute a market sell at the current simulated price.
+    /// Execute a market sell at the current price on `chain`.
     pub async fn sell(
         &self,
         db: &Db,
+        chain: &Chain,
         user_id: i64,
         wallet_id: Option<i64>,
         token_address: &str,
         quantity: f64,
         slippage: f64,
     ) -> Result<TradeReceipt> {
-        self.risk.validate_trade(token_address, quantity, slippage)?;
+        self.risk.validate_trade(token_address, quantity, slippage, chain.native)?;
         if quantity <= 0.0 {
             bail!("quantity must be positive");
         }
 
-        let price = self.sim.price(token_address);
+        let quote = self.market.quote(chain, token_address).await;
+        let price = quote.price_native;
+        if price <= 0.0 {
+            bail!("no valid price for this token on {}", chain.id);
+        }
         let proceeds = quantity * price;
 
         let conn = db.conn();
@@ -119,6 +133,7 @@ impl TradingEngine {
             &repo::NewOrder {
                 user_id,
                 wallet_id,
+                network: chain.id,
                 token_address,
                 side: "sell",
                 amount_in: Some(quantity),
@@ -139,17 +154,18 @@ impl TradingEngine {
         Ok(receipt)
     }
 
-    /// Record a pending limit order (not auto-filled in paper mode).
+    /// Record a pending limit order on `chain` (filled by the worker).
     pub async fn place_limit(
         &self,
         db: &Db,
+        chain: &Chain,
         user_id: i64,
         wallet_id: Option<i64>,
         token_address: &str,
         limit_price: f64,
-        amount_in: f64,
+        amount_native: f64,
     ) -> Result<Order> {
-        if limit_price <= 0.0 || amount_in <= 0.0 {
+        if limit_price <= 0.0 || amount_native <= 0.0 {
             bail!("price and amount must be positive");
         }
         let conn = db.conn();
@@ -158,9 +174,10 @@ impl TradingEngine {
             &repo::NewOrder {
                 user_id,
                 wallet_id,
+                network: chain.id,
                 token_address,
                 side: "limit",
-                amount_in: Some(amount_in),
+                amount_in: Some(amount_native),
                 amount_out: None,
                 price: Some(limit_price),
                 slippage: 0.0,
@@ -175,6 +192,50 @@ impl TradingEngine {
             .into_iter()
             .find(|o| o.id == order_id)
             .ok_or_else(|| anyhow::anyhow!("order not found after insert"))
+    }
+
+
+    /// Fill a pending limit order at the current market price (called by the
+    /// limit-order matcher worker). Updates the original order row in place.
+    pub async fn fill_limit(
+        &self,
+        db: &Db,
+        chain: &Chain,
+        order: &Order,
+    ) -> Result<TradeReceipt> {
+        let quote = self.market.quote(chain, &order.token_address).await;
+        let price = quote.price_native;
+        if price <= 0.0 {
+            bail!("no valid price for this token on {}", chain.id);
+        }
+        let amount = order.amount_in.unwrap_or(0.0);
+        if amount <= 0.0 {
+            bail!("limit order has no amount_in");
+        }
+        let quantity = amount / price;
+
+        let conn = db.conn();
+        let tx = conn.transaction().await?;
+        repo::add_to_position(
+            &tx,
+            order.user_id,
+            order.wallet_id,
+            chain.id,
+            &order.token_address,
+            quantity,
+            price,
+        )
+        .await?;
+        repo::execute_pending_order(&tx, order.id, quantity, price, "paper").await?;
+        let alerts_fired = repo::trigger_satisfied_alerts(&tx, order.user_id, &order.token_address, price).await?;
+        tx.commit().await?;
+
+        self.receipt(&conn, order.id, &order.token_address, Some(0.0))
+            .await
+            .map(|mut r| {
+                r.alerts_fired = alerts_fired;
+                r
+            })
     }
 
     /// Build a human/API-friendly receipt from a stored order row.
@@ -198,6 +259,8 @@ impl TradingEngine {
             position_avg_price: pos.as_ref().map(|p| p.avg_price).unwrap_or(0.0),
             realized_pnl,
             alerts_fired: 0,
+            tx_ref: "paper".to_string(),
+            explorer_link: None,
         })
     }
 }

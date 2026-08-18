@@ -39,6 +39,27 @@ pub struct Config {
     /// Optional 64-hex-char master key for encrypting wallet private keys.
     #[serde(default)]
     pub master_key: Option<String>,
+
+    /// Default EVM chain for new users and chain-less commands (e.g. `bsc`).
+    #[serde(default = "default_chain")]
+    pub default_chain: String,
+
+    /// When `true`, prices/liquidity come from DexScreener (with an offline
+    /// simulator fallback). Set `false` for fully deterministic paper trading.
+    #[serde(default = "default_true")]
+    pub live_market: bool,
+
+    /// 0x Swap API v2 key — enables real on-chain swaps (`/buy`, `/sell`).
+    #[serde(default)]
+    pub zeroex_api_key: Option<String>,
+
+    /// Optional honeypot.is API key for live honeypot simulations in /scan.
+    #[serde(default)]
+    pub honeypot_api_key: Option<String>,
+}
+
+fn default_chain() -> String {
+    "ethereum".to_string()
 }
 
 fn default_database_url() -> String {
@@ -67,6 +88,10 @@ impl Config {
                 "API_PORT",
                 "PAPER_TRADING",
                 "MASTER_KEY",
+                "DEFAULT_CHAIN",
+                "LIVE_MARKET",
+                "ZEROEX_API_KEY",
+                "HONEYPOT_API_KEY",
             ]))
             .merge(Env::prefixed("VELOCIDAD_").split("_"))
             .extract()?;

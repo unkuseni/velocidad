@@ -41,6 +41,12 @@ aes-gcm = "0.10"
 rand = "0.8"
 hex = "0.4"
 
+# HTTP client for DexScreener / RPC / 0x API
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# EVM transaction RLP encoding (EIP-1559)
+rlp = "0.5"
+
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
