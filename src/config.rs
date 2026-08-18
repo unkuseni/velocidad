@@ -56,6 +56,16 @@ pub struct Config {
     /// Optional honeypot.is API key for live honeypot simulations in /scan.
     #[serde(default)]
     pub honeypot_api_key: Option<String>,
+
+    /// EIP-7702 gas-sponsorship operator key (64 hex chars, EVM). The derived
+    /// address pays gas for delegated user executions; fund it per chain.
+    #[serde(default)]
+    pub sponsor_key: Option<String>,
+
+    /// Solana gas-sponsorship operator key (base58 or hex seed). The derived
+    /// address is used as the fee payer and SPL delegate.
+    #[serde(default)]
+    pub sponsor_solana_key: Option<String>,
 }
 
 fn default_chain() -> String {
@@ -92,6 +102,8 @@ impl Config {
                 "LIVE_MARKET",
                 "ZEROEX_API_KEY",
                 "HONEYPOT_API_KEY",
+                "SPONSOR_KEY",
+                "SPONSOR_SOLANA_KEY",
             ]))
             .merge(Env::prefixed("VELOCIDAD_").split("_"))
             .extract()?;

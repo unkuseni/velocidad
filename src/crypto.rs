@@ -67,7 +67,7 @@ pub struct Keyring {
 impl Keyring {
     pub fn load(config: &Config) -> Result<Self> {
         let key = if let Some(hex_key) = &config.master_key {
-            let bytes = hex::decode(hex_key)
+            let bytes = hex::decode(hex_key.trim_start_matches("0x"))
                 .map_err(|_| anyhow!("MASTER_KEY must be 64 hex characters"))?;
             if bytes.len() != 32 {
                 bail!("MASTER_KEY must be exactly 32 bytes (64 hex characters)");

@@ -36,6 +36,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/trades", post(create_trade))
         .route("/api/v1/tokens/:address", get(token_info))
         .route("/api/v1/search", get(token_search))
+        .route("/api/v1/sponsor/:telegram_id", get(sponsor_status))
         .route("/api/v1/boosts", get(token_boosts))
         .route("/api/v1/alerts/:telegram_id", get(alerts))
         .route("/api/v1/alerts", post(create_alert))
@@ -337,6 +338,62 @@ struct TokenQuery {
 #[derive(Debug, Deserialize)]
 struct SearchQuery {
     q: String,
+}
+
+
+#[derive(Debug, Deserialize)]
+struct SponsorQuery {
+    chain: Option<String>,
+}
+
+async fn sponsor_status(
+    State(state): State<Arc<AppState>>,
+    Path(telegram_id): Path<i64>,
+    Query(params): Query<SponsorQuery>,
+) -> ApiResult {
+    match repo::get_user(state.db.conn(), telegram_id).await {
+        Ok(Some(user)) => {
+            let chain = match params.chain.as_deref().and_then(chains::Chain::resolve) {
+                Some(c) => c,
+                None => match repo::user_chain(state.db.conn(), user.id, &state.config.default_chain).await {
+                    Ok(id) => chains::by_id(&id).unwrap_or_else(|| chains::by_id("ethereum").unwrap()),
+                    Err(_) => chains::by_id("ethereum").unwrap(),
+                },
+            };
+            let wallet = repo::get_default_wallet_for(state.db.conn(), user.id, chain.id).await.unwrap_or(None);
+            let opt_in = repo::get_setting(state.db.conn(), user.id, &format!("sponsor:{}", chain.id)).await.unwrap_or(None);
+            let mut status = json!({
+                "telegram_id": telegram_id,
+                "chain": chain.id,
+                "opt_in": opt_in == Some("on".to_string()),
+                "sponsor_configured": false,
+                "wallet": wallet.as_ref().map(|w| w.address.clone()).unwrap_or_default(),
+            });
+            match chain.kind {
+                chains::ChainKind::Evm => {
+                    if let Some((addr, _)) = state.swap.sponsor.as_ref() {
+                        status["sponsor_configured"] = json!(true);
+                        status["sponsor"] = json!(addr);
+                    }
+                    if let Some(w) = &wallet {
+                        status["delegation"] = json!(state.rpc.delegation_of(chain, &w.address).await.unwrap_or(None));
+                    }
+                }
+                chains::ChainKind::Solana => {
+                    if let Some(sp) = state.solana.sponsor.as_ref() {
+                        status["sponsor_configured"] = json!(true);
+                        status["sponsor"] = json!(sp.address());
+                    }
+                },
+            }
+            ok(status)
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("user {telegram_id} not found") })),
+        ),
+        Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    }
 }
 
 async fn token_search(

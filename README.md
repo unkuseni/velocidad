@@ -30,6 +30,7 @@ background workers: limit-order matching + price-alert polling
 | 🔔 Price alerts | `above`/`below` triggers checked by a background poller; instant Telegram notification |
 | 📂 Portfolio & PnL | Weighted-average positions, realized + unrealized PnL, per-chain with USD totals |
 | 💰 On-chain balances | Native + token balances via public RPCs (EVM ERC-20, Solana SPL) (`/balance`) |
+| ⛽ Gas sponsorship | Opt-in: EIP-7702 delegation (EVM) + SPL delegate/fee-payer (Solana) — the operator's sponsor key pays your gas (`/sponsor`) |
 | 🔍 Token discovery | `/find <ticker>` (full-text search), `/trending`, `/boosts` (DexScreener feeds) |
 | 🌐 Web API | Axum REST API mirroring the bot (see below) |
 | 🗄️ Storage | **libSQL** — local SQLite file or remote **Turso** (same code path) |
@@ -88,6 +89,29 @@ safe.** Then open your bot in Telegram:
 **Multi-chain:** prefix any token with `chain:` — `/buy bsc:0x…`, `/price arb:0x…`,
 `/scan sol:EPjF…`. Without a prefix the user's default chain (`/chain`) is used.
 Solana addresses are base58 mints; `sol:` also works as the prefix.
+
+## Gas-fee sponsorship (/sponsor)
+
+The bot can **pay your gas fees** on both chain families. It's fully opt-in:
+
+1. The operator sets `SPONSOR_KEY` (EVM) and/or `SPONSOR_SOLANA_KEY` and funds
+   the derived addresses with gas (EVM per chain, SOL on Solana).
+2. The operator deploys the sponsor account once per EVM chain: `/sponsor setup`
+   (deploys `contracts/SponsorAccount.sol` from the sponsor key).
+3. The user opts in per chain: `/sponsor on`:
+   - **EVM** — sends an **EIP-7702** set-code transaction delegating the user's
+     EOA to the SponsorAccount (type-0x04, signed locally, user pays gas once).
+     From then on the sponsor executes user swaps/approvals through the
+     delegate while paying the gas; funds always move from the user's balance.
+   - **Solana** — sets the sponsor as **SPL delegate** on the user's token
+     accounts (sponsored Approve txs) and rebuilds trade transactions with the
+     **sponsor as fee payer** (dual-signed: sponsor + user).
+4. `/sponsor status` shows delegation state (live `eth_getCode` check);
+   `/sponsor off` clears it (zero-address authorization / revoke).
+
+The EIP-7702 transaction builder and RFC6979 signing are golden-vector tested
+against **viem**; the Solana fee-payer rebuild + dual-signing pipeline is
+verified against **@solana/web3.js**.
 
 ## Live trading (on-chain swaps)
 
@@ -185,7 +209,9 @@ src/
 | `DEFAULT_CHAIN` | `ethereum` | default chain for chain-less commands (`solana` works too) |
 | `ZEROEX_API_KEY` | — | 0x Swap API v2 key → enables real on-chain swaps |
 | `HONEYPOT_API_KEY` | — | honeypot.is key → live honeypot simulations in /scan |
-| `MASTER_KEY` | auto-generated | 64-hex AES key for wallet encryption |
+| `SPONSOR_KEY` | — | EIP-7702 gas-sponsorship operator key (0x-hex) |
+| `SPONSOR_SOLANA_KEY` | — | Solana gas-sponsorship operator key (seed) |
+| `MASTER_KEY` | auto-generated | 64-hex AES key for wallet encryption (0x allowed) |
 
 All vars can also be prefixed `VELOCIDAD_` (e.g. `VELOCIDAD_API_PORT`).
 
@@ -195,6 +221,7 @@ All vars can also be prefixed `VELOCIDAD_` (e.g. `VELOCIDAD_API_PORT`).
 cargo test
 ```
 
-Covers chain resolution, DexScreener parsing, RLP/EIP-1559 transaction encoding
-(cross-validated against ethers.js golden vectors), ECDSA y-parity recovery,
-calldata packing and formatting helpers.
+Covers chain resolution, DexScreener parsing, RLP/EIP-1559/EIP-7702 transaction
+encoding (golden vectors vs ethers.js + viem), deterministic RFC6979 ECDSA
+(cross-wallet compatible), Solana address derivation + fee-payer rebuild
+(golden vectors vs @solana/web3.js), calldata packing and formatting helpers.

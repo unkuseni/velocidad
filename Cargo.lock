@@ -3598,6 +3598,7 @@ dependencies = [
  "ed25519-dalek",
  "figment",
  "hex",
+ "hmac",
  "k256",
  "libsql",
  "rand 0.8.7",

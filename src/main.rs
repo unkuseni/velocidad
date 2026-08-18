@@ -10,6 +10,7 @@ mod chains;
 mod config;
 mod crypto;
 mod db;
+mod eip7702;
 mod market;
 mod rpc;
 mod security;

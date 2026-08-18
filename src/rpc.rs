@@ -122,6 +122,22 @@ impl RpcClient {
         hex_u128(v)
     }
 
+    /// Code at an address (hex, 0x-prefixed).
+    pub async fn code(&self, chain: &Chain, address: &str) -> anyhow::Result<String> {
+        let v = self.call(chain, "eth_getCode", json!([address, "latest"])).await?;
+        v.as_str().map(|s| s.to_string()).ok_or_else(|| anyhow::anyhow!("eth_getCode returned non-string"))
+    }
+
+    /// EIP-7702 delegation target of an EOA, if delegated (0xef0100 || addr).
+    pub async fn delegation_of(&self, chain: &Chain, address: &str) -> anyhow::Result<Option<String>> {
+        let code = self.code(chain, address).await?;
+        if let Some(rest) = code.strip_prefix("0xef0100") {
+            if rest.len() >= 40 {
+                return Ok(Some(format!("0x{}", &rest[..40])));
+            }
+        }
+        Ok(None)
+    }
     /// Broadcast a signed raw transaction; returns the tx hash.
     pub async fn send_raw_transaction(&self, chain: &Chain, raw: &str) -> anyhow::Result<String> {
         let v = self.call(chain, "eth_sendRawTransaction", json!([raw])).await?;

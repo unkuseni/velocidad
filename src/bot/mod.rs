@@ -64,6 +64,8 @@ pub enum Command {
     Find(String),
     #[command(description = "top boosted tokens")]
     Boosts,
+    #[command(description = "gas sponsorship: /sponsor, /sponsor on|off|setup|status")]
+    Sponsor,
     #[command(description = "trading settings: /settings, /settings slippage 0.05")]
     Settings,
 }
@@ -133,6 +135,10 @@ async fn dispatch_command(
         Command::Trending => cmd_trending(&state, &msg).await,
         Command::Find(q) => cmd_find(&state, &msg, &q).await,
         Command::Boosts => cmd_boosts(&state, &msg).await,
+        Command::Sponsor => {
+            let arg = rest_of_command(&msg, "/sponsor");
+            cmd_sponsor(&state, &msg, arg).await
+        }
         Command::Settings => {
             let arg = rest_of_command(&msg, "/settings");
             cmd_settings(&state, &msg, arg).await
@@ -461,7 +467,8 @@ async fn cmd_buy(
         crate::chains::ChainKind::Solana => {
             // Live Solana swap via Jupiter (keyless).
             let secret = wallet_secret(state, &wallet)?;
-            let res = state.solana.buy(chain, &token, amount, slippage, &wallet.address, &secret).await?;
+            let sponsor = if user_sponsorship(state, user_id, chain).await? { state.solana.sponsor.as_ref() } else { None };
+            let res = state.solana.buy(chain, &token, amount, slippage, &wallet.address, &secret, sponsor).await?;
             if !res.success {
                 bail!("swap failed — tx {}", res.tx_signature);
             }
@@ -490,16 +497,59 @@ async fn cmd_buy(
             ))
         }
         crate::chains::ChainKind::Evm => {
-            // Live EVM swap via 0x.
+            // Live EVM swap via 0x — either self-paid or gas-sponsored.
             let secret = wallet_secret(state, &wallet)?;
             let amount_wei = (amount * 1e18) as u128;
             if amount_wei == 0 {
                 bail!("amount too small for a live swap");
             }
-            let res = state
-                .swap
-                .buy_native(chain, &token, amount_wei, slippage, &wallet.address, &secret)
-                .await?;
+            let sponsored = user_sponsorship(state, user_id, chain).await?;
+            let res = if sponsored {
+                let account = sponsor_account_for(state, chain).await?;
+                if account.is_empty() {
+                    bail!("sponsorship ON but no SponsorAccount on {} — run /sponsor setup", chain.id);
+                }
+                let target = state.rpc.delegation_of(chain, &wallet.address).await?;
+                if target.as_deref() != Some(account.as_str()) {
+                    bail!("EOA is not delegated to the sponsor account — run /sponsor on");
+                }
+                let (sponsor_addr, sponsor_secret) = state.swap.sponsor.as_ref().context("sponsor not configured")?;
+                let quote = state
+                    .swap
+                    .quote(chain, crate::swap::NATIVE, &token, amount_wei, &wallet.address, (slippage * 10_000.0) as u64)
+                    .await?;
+                let swap_data = hex::decode(quote.data.trim_start_matches("0x"))?;
+                let (hash, ok) = state
+                    .swap
+                    .sponsored_execute(
+                        chain,
+                        &wallet.address,
+                        sponsor_addr,
+                        sponsor_secret,
+                        &quote.to,
+                        quote.value,
+                        &swap_data,
+                        (quote.gas as f64 * 2.0) as u64,
+                    )
+                    .await?;
+                if !ok {
+                    bail!("sponsored swap reverted — tx {hash}");
+                }
+                crate::swap::LiveTradeResult {
+                    tx_hash: hash.clone(),
+                    success: true,
+                    token_amount: quote.buy_amount,
+                    native_amount: quote.sell_amount,
+                    price_native: quote.price_native,
+                    approval_tx: None,
+                    explorer_link: chain.explorer_link(&hash),
+                }
+            } else {
+                state
+                    .swap
+                    .buy_native(chain, &token, amount_wei, slippage, &wallet.address, &secret)
+                    .await?
+            };
             if !res.success {
                 bail!("swap reverted — tx {}", res.tx_hash);
             }
@@ -593,7 +643,8 @@ async fn cmd_sell(
     match chain.kind {
         crate::chains::ChainKind::Solana => {
             let secret = wallet_secret(state, &wallet)?;
-            let res = state.solana.sell(chain, &token, qty, slippage, &wallet.address, &secret).await?;
+            let sponsor = if user_sponsorship(state, user_id, chain).await? { state.solana.sponsor.as_ref() } else { None };
+            let res = state.solana.sell(chain, &token, qty, slippage, &wallet.address, &secret, sponsor).await?;
             if !res.success {
                 bail!("swap failed — tx {}", res.tx_signature);
             }
@@ -619,10 +670,71 @@ async fn cmd_sell(
         }
         crate::chains::ChainKind::Evm => {
             let secret = wallet_secret(state, &wallet)?;
-            let res = state
-                .swap
-                .sell_tokens(chain, &token, qty, slippage, &wallet.address, &secret)
-                .await?;
+            let sponsored = user_sponsorship(state, user_id, chain).await?;
+            let res = if sponsored {
+                let account = sponsor_account_for(state, chain).await?;
+                if account.is_empty() {
+                    bail!("sponsorship ON but no SponsorAccount on {} — run /sponsor setup", chain.id);
+                }
+                let target = state.rpc.delegation_of(chain, &wallet.address).await?;
+                if target.as_deref() != Some(account.as_str()) {
+                    bail!("EOA is not delegated to the sponsor account — run /sponsor on");
+                }
+                let (sponsor_addr, sponsor_secret) = state.swap.sponsor.as_ref().context("sponsor not configured")?;
+                let decimals = state.rpc.erc20_decimals(chain, &token).await;
+                let amount_wei = (qty * 10f64.powi(decimals as i32)) as u128;
+                let quote = state
+                    .swap
+                    .quote(chain, &token, crate::swap::NATIVE, amount_wei, &wallet.address, (slippage * 10_000.0) as u64)
+                    .await?;
+                // Sponsored approval when the swap needs an allowance.
+                let mut approval_tx: Option<String> = None;
+                if let Some(spender) = &quote.allowance_target {
+                    let current = state.rpc.erc20_allowance(chain, &token, &wallet.address, spender).await.unwrap_or(0);
+                    if current < amount_wei {
+                        let approve_data = crate::swap::SwapClient::approve_calldata(spender, amount_wei)?;
+                        let (ahash, aok) = state
+                            .swap
+                            .sponsored_execute(chain, &wallet.address, sponsor_addr, sponsor_secret, &token, 0, &approve_data, 150_000)
+                            .await?;
+                        if !aok {
+                            bail!("sponsored approval reverted — tx {ahash}");
+                        }
+                        approval_tx = Some(ahash);
+                    }
+                }
+                let swap_data = hex::decode(quote.data.trim_start_matches("0x"))?;
+                let (hash, ok) = state
+                    .swap
+                    .sponsored_execute(
+                        chain,
+                        &wallet.address,
+                        sponsor_addr,
+                        sponsor_secret,
+                        &quote.to,
+                        quote.value,
+                        &swap_data,
+                        (quote.gas as f64 * 2.0) as u64,
+                    )
+                    .await?;
+                if !ok {
+                    bail!("sponsored swap reverted — tx {hash}");
+                }
+                crate::swap::LiveTradeResult {
+                    tx_hash: hash.clone(),
+                    success: true,
+                    token_amount: quote.sell_amount,
+                    native_amount: quote.buy_amount,
+                    price_native: 1.0 / quote.price_native.max(1e-18),
+                    approval_tx,
+                    explorer_link: chain.explorer_link(&hash),
+                }
+            } else {
+                state
+                    .swap
+                    .sell_tokens(chain, &token, qty, slippage, &wallet.address, &secret)
+                    .await?
+            };
             if !res.success {
                 bail!("swap reverted — tx {}", res.tx_hash);
             }
@@ -903,6 +1015,199 @@ async fn cmd_boosts(state: &AppState, msg: &Message) -> Result<String> {
     Ok(s)
 }
 
+async fn cmd_sponsor(state: &AppState, msg: &Message, arg: Option<String>) -> Result<String> {
+    let user_id = ensure_user(state, msg).await?;
+    let chain = state.user_chain(user_id).await;
+    let wallet = match wallet_for_chain(state, user_id, chain).await {
+        Ok(w) => w,
+        Err(_) => return Ok("👛 Create a wallet first (EVM: /wallet new, Solana: /wallet new solana).".to_string()),
+    };
+    let secret = wallet_secret(state, &wallet)?;
+
+    match arg.as_deref() {
+        None | Some("status") => sponsorship_status(state, user_id, chain, &wallet).await,
+        Some("on") => sponsorship_on(state, user_id, chain, &wallet, &secret).await,
+        Some("off") => sponsorship_off(state, user_id, chain, &wallet, &secret).await,
+        Some("setup") => sponsorship_setup(state, chain).await,
+        Some(other) => Ok(format!(
+            "Unknown /sponsor action <code>{other}</code>. Use: on · off · status · setup",
+        )),
+    }
+}
+
+/// Opt in: EVM → EIP-7702 delegation tx; Solana → SPL delegate on all balances.
+async fn sponsorship_on(
+    state: &AppState,
+    user_id: i64,
+    chain: &Chain,
+    wallet: &crate::db::models::Wallet,
+    secret: &[u8; 32],
+) -> Result<String> {
+    let setting_key = format!("sponsor:{}", chain.id);
+    match chain.kind {
+        crate::chains::ChainKind::Evm => {
+            let Some((sponsor_addr, _)) = state.swap.sponsor.as_ref() else {
+                return Ok("⚠️ No sponsor configured — the operator must set SPONSOR_KEY.".to_string());
+            };
+            let account = sponsor_account_for(state, chain).await?;
+            if account.is_empty() {
+                return Ok("⚠️ No SponsorAccount deployed on this chain yet — run /sponsor setup first.".to_string());
+            }
+            // Already delegated?
+            if let Ok(Some(target)) = state.rpc.delegation_of(chain, &wallet.address).await {
+                repo::set_setting(state.db.conn(), user_id, &setting_key, "on").await?;
+                return Ok(format!(
+                    "✅ Already delegated to <code>{}</code> — sponsorship ON for {}.\nGas will be paid by <code>{}</code>.",
+                    short_addr(&target),
+                    chain.id,
+                    short_addr(sponsor_addr)
+                ));
+            }
+            let hash = state.swap.send_delegation(chain, &wallet.address, secret, &account).await?;
+            repo::set_setting(state.db.conn(), user_id, &setting_key, "on").await?;
+            Ok(format!(
+                "🪪 <b>EIP-7702 delegation set</b> ({})\n\n\
+                 EOA: <code>{}</code>\n\
+                 Delegate: <code>{}</code>\n\
+                 Gas sponsor: <code>{}</code>\n\
+                 🔗 <a href=\"{}\">{}</a>\n\n\
+                 ℹ️ From now on, sponsored trades pay no gas — the sponsor covers fees.",
+                chain.id,
+                short_addr(&wallet.address),
+                short_addr(&account),
+                short_addr(sponsor_addr),
+                chain.explorer_link(&hash),
+                short_addr(&hash)
+            ))
+        }
+        crate::chains::ChainKind::Solana => {
+            let Some(sp) = state.solana.sponsor.as_ref() else {
+                return Ok("⚠️ No Solana sponsor configured — the operator must set SPONSOR_SOLANA_KEY.".to_string());
+            };
+            let blockhash = state.solana.latest_blockhash(chain).await?;
+            let owner: [u8; 32] = bs58::decode(wallet.address.trim()).into_vec().context("bad wallet")?.try_into().map_err(|_| anyhow::anyhow!("bad pubkey"))?;
+            let balances = state.solana.spl_balances(chain, &wallet.address).await?;
+            let mut txs: Vec<String> = Vec::new();
+            for b in balances.iter().filter(|b| b.amount > 0.0) {
+                let account_bytes: [u8; 32] = bs58::decode(b.account.trim()).into_vec().ok().and_then(|v| v.try_into().ok()).context("bad token account")?;
+                let raw_amount = (b.amount * 10f64.powi(b.decimals as i32)) as u64;
+                let (message, signers) = crate::solana::build_sponsored_approve(&owner, &account_bytes, &sp.pubkey, raw_amount, &sp.pubkey, &blockhash);
+                let sig = state.solana.send_sponsored(chain, &message, &signers, &[&sp.seed, secret]).await?;
+                txs.push(format!("  ✅ {} · <code>{}</code>", b.mint, short_addr(&sig)));
+            }
+            if txs.is_empty() {
+                return Ok("🪐 No non-zero token balances to delegate. Fund the wallet first, then /sponsor on.".to_string());
+            }
+            repo::set_setting(state.db.conn(), user_id, &setting_key, "on").await?;
+            Ok(format!(
+                "🪐 <b>Solana delegation set</b>\n\nSponsor (delegate + fee payer): <code>{}</code>\n\n{}\n\nℹ️ Your trades are now sponsored — the sponsor pays tx fees.\nTokens delegated: {} accounts",
+                sp.address(),
+                txs.join("\n"),
+                txs.len()
+            ))
+        }
+    }
+}
+
+async fn sponsorship_off(
+    state: &AppState,
+    user_id: i64,
+    chain: &Chain,
+    wallet: &crate::db::models::Wallet,
+    secret: &[u8; 32],
+) -> Result<String> {
+    let setting_key = format!("sponsor:{}", chain.id);
+    match chain.kind {
+        crate::chains::ChainKind::Evm => {
+            let hash = state.swap.clear_delegation(chain, &wallet.address, secret).await?;
+            repo::set_setting(state.db.conn(), user_id, &setting_key, "off").await?;
+            Ok(format!("🪪 Delegation cleared ({}). 🔗 {}", chain.id, chain.explorer_link(&hash)))
+        }
+        crate::chains::ChainKind::Solana => {
+            repo::set_setting(state.db.conn(), user_id, &setting_key, "off").await?;
+            Ok("🪐 Solana sponsorship OFF (delegates kept — revoke manually or re-run /sponsor on with a zero allowance).".to_string())
+        }
+    }
+}
+
+async fn sponsorship_status(
+    state: &AppState,
+    user_id: i64,
+    chain: &Chain,
+    wallet: &crate::db::models::Wallet,
+) -> Result<String> {
+    let setting_key = format!("sponsor:{}", chain.id);
+    let opt_in = repo::get_setting(state.db.conn(), user_id, &setting_key).await?.unwrap_or_default();
+    match chain.kind {
+        crate::chains::ChainKind::Evm => {
+            let delegated = state.rpc.delegation_of(chain, &wallet.address).await.unwrap_or(None);
+            let sponsor_addr = state.swap.sponsor.as_ref().map(|(a, _)| a.clone()).unwrap_or_default();
+            let account = sponsor_account_for(state, chain).await.unwrap_or_default();
+            Ok(format!(
+                "🪪 <b>Gas sponsorship</b> — {}\n\n\
+                 Opt-in: <b>{}</b>\n\
+                 Delegation: <b>{}</b>\n\
+                 Delegate contract: <code>{}</code>\n\
+                 Sponsor: <code>{}</code>\n\n\
+                 /sponsor on · /sponsor off · /sponsor setup",
+                chain.id,
+                if opt_in == "on" { "ON ✅" } else { "off" },
+                match &delegated {
+                    Some(t) => format!("set → <code>{}</code>", short_addr(t)),
+                    None => "none".to_string(),
+                },
+                if account.is_empty() { "— (run /sponsor setup)".to_string() } else { account },
+                if sponsor_addr.is_empty() { "not configured".to_string() } else { sponsor_addr },
+            ))
+        }
+        crate::chains::ChainKind::Solana => {
+            let sp_addr = state.solana.sponsor.as_ref().map(|s| s.address()).unwrap_or_default();
+            Ok(format!(
+                "🪐 <b>Gas sponsorship</b> — solana\n\n\
+                 Opt-in: <b>{}</b>\n\
+                 Sponsor (fee payer / delegate): <code>{}</code>\n\n\
+                 /sponsor on · /sponsor off",
+                if opt_in == "on" { "ON ✅" } else { "off" },
+                if sp_addr.is_empty() { "not configured".to_string() } else { sp_addr },
+            ))
+        }
+    }
+}
+
+/// Deploy the SponsorAccount (operator action, once per chain) and store the
+/// address in the global settings (user_id 0).
+async fn sponsorship_setup(state: &AppState, chain: &Chain) -> Result<String> {
+    if chain.kind != crate::chains::ChainKind::Evm {
+        return Ok("🪐 Sponsor setup is EVM-only; Solana sponsorship uses the operator key directly.".to_string());
+    }
+    let Some((sponsor_addr, sponsor_secret)) = state.swap.sponsor.as_ref() else {
+        return Ok("⚠️ SPONSOR_KEY is not set — the operator must configure it.".to_string());
+    };
+    if let Ok(account) = sponsor_account_for(state, chain).await {
+        if !account.is_empty() {
+            return Ok(format!("✅ SponsorAccount already deployed on {}: <code>{}</code>", chain.id, account));
+        }
+    }
+    let (address, hash) = state.swap.deploy_sponsor_account(chain, sponsor_addr, sponsor_secret).await?;
+    repo::set_setting(state.db.conn(), 0, &format!("sponsor_account:{}", chain.id), &address).await?;
+    Ok(format!(
+        "🏗️ <b>SponsorAccount deployed</b> ({})\n\n\
+         Address: <code>{}</code>\n\
+         Sponsor: <code>{}</code>\n\
+         🔗 {}\n\n\
+         Users can now /sponsor on to delegate their EOA.",
+        chain.id,
+        address,
+        short_addr(sponsor_addr),
+        chain.explorer_link(&hash)
+    ))
+}
+
+/// Look up the deployed SponsorAccount address for a chain (global setting).
+async fn sponsor_account_for(state: &AppState, chain: &Chain) -> Result<String> {
+    Ok(repo::get_setting(state.db.conn(), 0, &format!("sponsor_account:{}", chain.id)).await?.unwrap_or_default())
+}
+
 fn sanitize_html(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
@@ -1091,6 +1396,18 @@ async fn wallet_for_chain(
         }
     }
 }
+/// Whether the user opted into gas sponsorship on this chain (and it's configured).
+async fn user_sponsorship(state: &AppState, user_id: i64, chain: &Chain) -> Result<bool> {
+    let setting = repo::get_setting(state.db.conn(), user_id, &format!("sponsor:{}", chain.id)).await?;
+    if setting.as_deref() != Some("on") {
+        return Ok(false);
+    }
+    Ok(match chain.kind {
+        crate::chains::ChainKind::Evm => state.swap.sponsor.is_some(),
+        crate::chains::ChainKind::Solana => state.solana.sponsor.is_some(),
+    })
+}
+
 /// Parse `chain:0x…` / `0x…` token arguments.
 fn parse_token_arg(input: &str, default: &'static Chain) -> Result<(&'static Chain, String)> {
     Chain::resolve_token_arg(input, default)

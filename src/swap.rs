@@ -11,8 +11,8 @@
 
 use std::time::Duration;
 
-use k256::ecdsa::{Signature, SigningKey};
 use serde::Deserialize;
+use sha3::Digest;
 
 use crate::chains::Chain;
 use crate::rpc::RpcClient;
@@ -117,10 +117,12 @@ pub struct SwapClient {
     http: reqwest::Client,
     api_key: Option<String>,
     rpc: RpcClient,
+    /// (sponsor address, secret) for EIP-7702 gas sponsorship, when configured.
+    pub sponsor: Option<(String, [u8; 32])>,
 }
 
 impl SwapClient {
-    pub fn new(api_key: Option<String>) -> Self {
+    pub fn new(api_key: Option<String>, sponsor: Option<(String, [u8; 32])>) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
@@ -128,6 +130,7 @@ impl SwapClient {
                 .expect("failed to build 0x HTTP client"),
             api_key,
             rpc: RpcClient::new(),
+            sponsor,
         }
     }
 
@@ -271,10 +274,10 @@ pub struct LiveTradeResult {
 /// Sign an EIP-1559 transaction with a 32-byte secret key.
 /// Returns `0x02 || rlp([chain_id, nonce, prio, max_fee, gas, to, value, data, [], y_parity, r, s])`.
 pub fn sign_1559(tx: &Tx1559, secret: &[u8; 32]) -> anyhow::Result<String> {
-    use k256::ecdsa::signature::hazmat::PrehashSigner;
     use sha3::{Digest, Keccak256};
 
-    let to = decode_address(&tx.to)?;
+    // Empty to = contract deployment (rlp empty string 0x80).
+    let to = if tx.to.is_empty() { Vec::new() } else { decode_address(&tx.to)? };
 
     let mut unsigned = rlp::RlpStream::new_list(9);
     append_u(&mut unsigned, tx.chain_id);
@@ -292,16 +295,7 @@ pub fn sign_1559(tx: &Tx1559, secret: &[u8; 32]) -> anyhow::Result<String> {
     payload.extend_from_slice(unsigned.as_raw());
 
     let hash: [u8; 32] = Keccak256::digest(&payload).into();
-
-    let sk = SigningKey::from_bytes(secret.into()).map_err(|_| anyhow::anyhow!("invalid signing key"))?;
-    let sig: Signature = sk
-        .sign_prehash(&hash)
-        .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let y_parity = recovery_y_parity(&sk, &sig, &hash)?;
-
-    let r = sig.r().to_bytes();
-    let s = sig.s().to_bytes();
+    let (y_parity, r, s) = crate::eip7702::sign_hash(&hash, secret)?;
 
     // 12 fields: chain_id, nonce, prio, max_fee, gas, to, value, data, access_list, y_parity, r, s
     let mut signed = rlp::RlpStream::new_list(12);
@@ -315,44 +309,13 @@ pub fn sign_1559(tx: &Tx1559, secret: &[u8; 32]) -> anyhow::Result<String> {
     append_u(&mut signed, tx.data.clone());
     signed.begin_list(0);
     append_u(&mut signed, y_parity);
-    append_u(&mut signed, r.to_vec());
-    append_u(&mut signed, s.to_vec());
+    append_u(&mut signed, r);
+    append_u(&mut signed, s);
 
     let mut raw = Vec::with_capacity(1 + signed.as_raw().len());
     raw.push(0x02);
     raw.extend_from_slice(signed.as_raw());
     Ok(format!("0x{}", hex::encode(raw)))
-}
-
-/// Compute the ECDSA y-parity recovery bit for a signature by recovering
-/// the ephemeral point R = r^-1 (sG - eP) and reading the parity of its y.
-/// (k256 has no recoverable-signing feature; this is the standard derivation.)
-fn recovery_y_parity(
-    sk: &SigningKey,
-    sig: &Signature,
-    hash: &[u8; 32],
-) -> anyhow::Result<u64> {
-    use k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-    use k256::elliptic_curve::PrimeField;
-    use k256::{AffinePoint, ProjectivePoint, Scalar};
-
-    let e = Option::<Scalar>::from(Scalar::from_repr((*hash).into())).unwrap_or(Scalar::ZERO);
-    let r = Scalar::from(*sig.r());
-    let s = Scalar::from(*sig.s());
-
-    let enc = sk.verifying_key().to_encoded_point(false);
-    let pk = AffinePoint::from_encoded_point(&enc).unwrap();
-    let r_inv = Option::<Scalar>::from(r.invert())
-        .ok_or_else(|| anyhow::anyhow!("signature r not invertible"))?;
-
-    // R = r^-1 (sG - eP); read the parity of R.y from the SEC1 encoding.
-    let r_point = (ProjectivePoint::GENERATOR * s - ProjectivePoint::from(pk) * e) * r_inv;
-    let enc = r_point.to_affine().to_encoded_point(false);
-    let bytes = enc.as_bytes();
-    if bytes.len() < 65 {
-        anyhow::bail!("recovered point is the identity");
-    }
-    Ok((bytes[64] & 1) as u64)
 }
 
 /// Append any value that implements rlp's Encodable.
@@ -374,7 +337,12 @@ impl SwapClient {
             anyhow::bail!("RPC chain id mismatch: expected {}, got {}", chain.chain_id, actual);
         }
         let raw = sign_1559(tx, secret)?;
-        let hash = self.rpc.send_raw_transaction(chain, &raw).await?;
+        self.send_and_wait(chain, &raw).await
+    }
+
+    /// Send a raw signed transaction and wait for its receipt.
+    pub async fn send_and_wait(&self, chain: &Chain, raw: &str) -> anyhow::Result<(String, bool)> {
+        let hash = self.rpc.send_raw_transaction(chain, raw).await?;
         let receipt = self
             .rpc
             .wait_for_receipt(chain, &hash, Duration::from_secs(90))
@@ -395,6 +363,18 @@ impl SwapClient {
         let floor = priority + 1_000_000_000; // at least 1 gwei above priority
         let max_fee = (gas_price * 2).max(quote_gas_price * 2).max(floor);
         (priority.min(max_fee), max_fee)
+    }
+
+    /// ERC20 approve(address,uint256) calldata for a spender + amount (wei).
+    pub fn approve_calldata(spender: &str, amount_wei: u128) -> anyhow::Result<Vec<u8>> {
+        let mut data = hex::decode("095ea7b3")?;
+        let mut arg = [0u8; 32];
+        arg[12..].copy_from_slice(&decode_address(spender)?);
+        data.extend_from_slice(&arg);
+        let mut amount = [0u8; 32];
+        amount[16..].copy_from_slice(&amount_wei.to_be_bytes());
+        data.extend_from_slice(&amount);
+        Ok(data)
     }
 
     /// Send ERC20 approve(spender, amount) and wait for it to mine.
@@ -498,6 +478,161 @@ impl SwapClient {
         Ok((hash, ok, approval))
     }
 
+
+    // -----------------------------------------------------------------------
+    // Gas-fee sponsorship (EIP-7702 delegation)
+    // -----------------------------------------------------------------------
+
+    /// Send an EIP-7702 delegation tx: the user's EOA delegates to
+    /// `delegate` (the SponsorAccount). The user signs and pays gas once.
+    pub async fn send_delegation(
+        &self,
+        chain: &Chain,
+        user_address: &str,
+        user_secret: &[u8; 32],
+        delegate: &str,
+    ) -> anyhow::Result<String> {
+        let nonce = self.rpc.nonce(chain, user_address).await?;
+        let (priority, max_fee) = self.fees(chain, 0).await;
+        let gas = self
+            .rpc
+            .estimate_gas(chain, user_address, user_address, "0x0", "0x")
+            .await
+            .unwrap_or(80_000)
+            .max(60_000);
+        let tx = crate::eip7702::Tx7702 {
+            chain_id: chain.chain_id,
+            nonce,
+            max_priority_fee: priority,
+            max_fee,
+            gas: gas as u64,
+            to: user_address.to_string(),
+            value: 0,
+            data: vec![],
+            authorization: Some(crate::eip7702::Authorization {
+                chain_id: chain.chain_id,
+                address: delegate.to_string(),
+                nonce,
+            }),
+        };
+        let raw = crate::eip7702::sign_7702(&tx, user_secret)?;
+        let (hash, ok) = self.send_and_wait(chain, &raw).await?;
+        if !ok {
+            anyhow::bail!("delegation reverted: {hash}");
+        }
+        Ok(hash)
+    }
+
+    /// Clear an EIP-7702 delegation (authorization to the zero address).
+    pub async fn clear_delegation(
+        &self,
+        chain: &Chain,
+        user_address: &str,
+        user_secret: &[u8; 32],
+    ) -> anyhow::Result<String> {
+        let nonce = self.rpc.nonce(chain, user_address).await?;
+        let (priority, max_fee) = self.fees(chain, 0).await;
+        let tx = crate::eip7702::Tx7702 {
+            chain_id: chain.chain_id,
+            nonce,
+            max_priority_fee: priority,
+            max_fee,
+            gas: 80_000,
+            to: user_address.to_string(),
+            value: 0,
+            data: vec![],
+            authorization: Some(crate::eip7702::Authorization {
+                chain_id: chain.chain_id,
+                address: crate::eip7702::ZERO_DELEGATION.to_string(),
+                nonce,
+            }),
+        };
+        let raw = crate::eip7702::sign_7702(&tx, user_secret)?;
+        let (hash, ok) = self.send_and_wait(chain, &raw).await?;
+        if !ok {
+            anyhow::bail!("delegation clear reverted: {hash}");
+        }
+        Ok(hash)
+    }
+
+    /// Deploy a SponsorAccount from the sponsor key; returns (address, tx hash).
+    pub async fn deploy_sponsor_account(
+        &self,
+        chain: &Chain,
+        sponsor_address: &str,
+        sponsor_secret: &[u8; 32],
+    ) -> anyhow::Result<(String, String)> {
+        let nonce = self.rpc.nonce(chain, sponsor_address).await?;
+        // address = keccak(rlp([sender, nonce]))[12:]
+        let mut stream = rlp::RlpStream::new_list(2);
+        stream.append(&crate::swap::decode_address(sponsor_address)?);
+        stream.append(&nonce);
+        let hash: [u8; 32] = sha3::Keccak256::digest(stream.as_raw()).into();
+        let address = format!("0x{}", hex::encode(&hash[12..]));
+
+        let data = crate::eip7702::sponsor_deploy_data(sponsor_address)?;
+        let data_hex = format!("0x{}", hex::encode(&data));
+        let gas = self
+            .rpc
+            .estimate_gas(chain, sponsor_address, "", "0x0", &data_hex)
+            .await
+            .unwrap_or(700_000);
+        let (priority, max_fee) = self.fees(chain, 0).await;
+        let tx = Tx1559 {
+            chain_id: chain.chain_id,
+            nonce,
+            max_priority_fee: priority,
+            max_fee,
+            gas: (gas as f64 * 1.3) as u64,
+            to: String::new(),
+            value: 0,
+            data,
+        };
+        let raw = sign_1559(&tx, sponsor_secret)?;
+        let (hash, ok) = self.send_and_wait(chain, &raw).await?;
+        if !ok {
+            anyhow::bail!("sponsor account deploy reverted: {hash}");
+        }
+        Ok((address, hash))
+    }
+
+    /// Sponsor-pays-gas execution: the sponsor signs a tx to the delegated
+    /// EOA calling SponsorAccount.execute(target, value, data). Funds move
+    /// from the USER's balance (delegated context); gas is paid by the sponsor.
+    pub async fn sponsored_execute(
+        &self,
+        chain: &Chain,
+        user_eoa: &str,
+        sponsor_address: &str,
+        sponsor_secret: &[u8; 32],
+        target: &str,
+        value: u128,
+        data: &[u8],
+        gas_floor: u64,
+    ) -> anyhow::Result<(String, bool)> {
+        let call = crate::eip7702::sponsor_execute_calldata(target, value, data)?;
+        let call_hex = format!("0x{}", hex::encode(&call));
+        let gas = self
+            .rpc
+            .estimate_gas(chain, sponsor_address, user_eoa, "0x0", &call_hex)
+            .await
+            .unwrap_or(gas_floor as u128)
+            .max(gas_floor as u128);
+        let (priority, max_fee) = self.fees(chain, 0).await;
+        let nonce = self.rpc.nonce(chain, sponsor_address).await?;
+        let tx = Tx1559 {
+            chain_id: chain.chain_id,
+            nonce,
+            max_priority_fee: priority,
+            max_fee,
+            gas: (gas as f64 * 1.2) as u64,
+            to: user_eoa.to_string(),
+            value: 0, // swap value is pulled from the user's balance
+            data: call,
+        };
+        let raw = sign_1559(&tx, sponsor_secret)?;
+        self.send_and_wait(chain, &raw).await
+    }
     /// Live buy: spend `amount_native_wei` of the chain's native coin for a token.
     pub async fn buy_native(
         &self,
