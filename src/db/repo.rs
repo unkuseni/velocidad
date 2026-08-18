@@ -564,16 +564,20 @@ pub async fn list_alerts(conn: &Connection, user_id: i64) -> Result<Vec<Alert>> 
 pub async fn trigger_satisfied_alerts(
     conn: &Connection,
     user_id: i64,
+    network: &str,
     token_address: &str,
     price: f64,
 ) -> Result<i64> {
+    // Network-scoped: identical EVM addresses on different chains must not
+    // fire each other's alerts. A non-positive price never satisfies.
     let fired = conn
         .execute(
             "UPDATE alerts SET is_triggered = 1, triggered_at = datetime('now')
-             WHERE user_id = ?1 AND token_address = ?2 AND is_triggered = 0
-               AND ((condition = 'above' AND ?3 >= target_price)
-                 OR (condition = 'below' AND ?3 <= target_price))",
-            params![user_id, token_address, price],
+             WHERE user_id = ?1 AND network = ?2 AND token_address = ?3
+               AND is_triggered = 0 AND ?4 > 0
+               AND ((condition = 'above' AND ?4 >= target_price)
+                 OR (condition = 'below' AND ?4 <= target_price))",
+            params![user_id, network, token_address, price],
         )
         .await?;
     Ok(fired as i64)
@@ -688,15 +692,17 @@ pub async fn execute_pending_order(
     amount_out: f64,
     price: f64,
     tx_hash: &str,
-) -> Result<()> {
-    conn.execute(
-        "UPDATE orders SET status = 'executed', amount_out = ?2, price = ?3,
-                           tx_hash = ?4, executed_at = datetime('now')
-         WHERE id = ?1",
-        params![id, amount_out, price, tx_hash],
-    )
-    .await?;
-    Ok(())
+) -> Result<u64> {
+    // The status guard makes a second tick a no-op instead of a double fill.
+    let affected = conn
+        .execute(
+            "UPDATE orders SET status = 'executed', amount_out = ?2, price = ?3,
+                               tx_hash = ?4, executed_at = datetime('now')
+             WHERE id = ?1 AND status = 'pending'",
+            params![id, amount_out, price, tx_hash],
+        )
+        .await?;
+    Ok(affected)
 }
 
 /// Mark a single alert as triggered (used by the alert poller).

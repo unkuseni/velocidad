@@ -3597,6 +3597,7 @@ dependencies = [
  "dotenvy",
  "ed25519-dalek",
  "figment",
+ "futures",
  "hex",
  "hmac",
  "k256",

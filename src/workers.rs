@@ -16,23 +16,30 @@ use crate::chains;
 use crate::db::repo;
 use crate::market;
 
-/// Spawn both workers; they run until the process exits.
+/// Spawn both workers; they run until the process exits. Matching and
+/// alerting work headless (API-only deployments); notifications are a
+/// no-op without a Telegram token.
 pub fn spawn(state: Arc<AppState>) {
     let token = state.config.teloxide_token.clone();
-    if token.trim().is_empty() {
-        tracing::warn!("TELOXIDE_TOKEN missing — notifications disabled");
-        return;
-    }
-    let bot = Bot::new(token);
+    let bot = if token.trim().is_empty() {
+        tracing::warn!("TELOXIDE_TOKEN missing — notifications disabled, workers still run");
+        None
+    } else {
+        Some(Bot::new(token))
+    };
     tokio::spawn(limit_matcher(Arc::clone(&state), bot.clone()));
     tokio::spawn(alert_poller(state, bot));
     tracing::info!("background workers started (limits + alerts)");
 }
 
-async fn limit_matcher(state: Arc<AppState>, bot: Bot) {
+async fn limit_matcher(state: Arc<AppState>, bot: Option<Bot>) {
     let mut interval = tokio::time::interval(Duration::from_secs(15));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
+        if let Ok(mut hb) = state.worker_heartbeat.lock() {
+            *hb = std::time::Instant::now();
+        }
         match match_limits(&state, &bot).await {
             Ok(n) if n > 0 => tracing::info!(filled = n, "limit orders filled"),
             Ok(_) => {}
@@ -41,7 +48,7 @@ async fn limit_matcher(state: Arc<AppState>, bot: Bot) {
     }
 }
 
-async fn match_limits(state: &AppState, bot: &Bot) -> anyhow::Result<usize> {
+async fn match_limits(state: &AppState, bot: &Option<Bot>) -> anyhow::Result<usize> {
     let orders = repo::list_pending_limits(state.db.conn()).await?;
     if orders.is_empty() {
         return Ok(0);
@@ -65,8 +72,16 @@ async fn match_limits(state: &AppState, bot: &Bot) -> anyhow::Result<usize> {
         };
         let price = quote.price_native;
         let limit_price = order.price.unwrap_or(0.0);
-        // Zero/unpriced tokens must never satisfy a trigger.
+        // Zero/unpriced/simulated quotes must never satisfy a trigger.
         if limit_price <= 0.0 || price <= 0.0 || price > limit_price {
+            continue;
+        }
+        if quote.source == "simulator" {
+            tracing::warn!(
+                order = order.id,
+                token = %order.token_address,
+                "limit trigger on a simulated quote — skipping"
+            );
             continue;
         }
 
@@ -92,26 +107,45 @@ async fn match_limits(state: &AppState, bot: &Bot) -> anyhow::Result<usize> {
                 )
                 .await;
             }
-            Err(e) => {
-                let _ = repo::fail_order(state.db.conn(), order.id, &e.to_string()).await;
-                tracing::warn!(order = order.id, error = %e, "limit fill failed");
+            Err(crate::trading::LimitFillError::Skip(reason)) => {
+                tracing::debug!(order = order.id, reason = %reason, "limit fill deferred");
+            }
+            Err(crate::trading::LimitFillError::Fail(reason)) => {
+                let _ = repo::fail_order(state.db.conn(), order.id, &reason).await;
+                tracing::warn!(order = order.id, error = %reason, "limit fill failed");
+                notify(
+                    bot,
+                    state,
+                    order.user_id,
+                    format!(
+                        "❌ <b>LIMIT ORDER #{} FAILED</b>\n\nToken: <code>{}</code>\nReason: {}",
+                        order.id,
+                        market::short_addr(&order.token_address),
+                        esc(&reason)
+                    ),
+                )
+                .await;
             }
         }
     }
     Ok(filled)
 }
 
-async fn alert_poller(state: Arc<AppState>, bot: Bot) {
+async fn alert_poller(state: Arc<AppState>, bot: Option<Bot>) {
     let mut interval = tokio::time::interval(Duration::from_secs(20));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
+        if let Ok(mut hb) = state.worker_heartbeat.lock() {
+            *hb = std::time::Instant::now();
+        }
         if let Err(e) = poll_alerts(&state, &bot).await {
             tracing::warn!(error = %e, "alert poller error");
         }
     }
 }
 
-async fn poll_alerts(state: &AppState, bot: &Bot) -> anyhow::Result<usize> {
+async fn poll_alerts(state: &AppState, bot: &Option<Bot>) -> anyhow::Result<usize> {
     let alerts = repo::list_untriggered_alerts(state.db.conn()).await?;
     let mut fired = 0;
     // One batched DexScreener request per chain instead of one per alert.
@@ -126,8 +160,8 @@ async fn poll_alerts(state: &AppState, bot: &Bot) -> anyhow::Result<usize> {
             continue;
         };
         let price = quote.price_native;
-        // Guard against zero-price simulator garbage triggering "below" alerts.
-        if price <= 0.0 {
+        // Zero-price and fabricated (simulator) quotes must never fire alerts.
+        if price <= 0.0 || quote.source == "simulator" {
             continue;
         }
         let hit = match alert.condition.as_str() {
@@ -192,7 +226,11 @@ fn esc(s: &str) -> String {
 }
 
 /// Send a Telegram notification to a user; failures are logged, not fatal.
-async fn notify(bot: &Bot, state: &AppState, user_id: i64, text: String) {
+/// A no-op when the bot token is not configured (headless mode).
+async fn notify(bot: &Option<Bot>, state: &AppState, user_id: i64, text: String) {
+    let Some(bot) = bot else {
+        return;
+    };
     let Ok(Some(user)) = repo::get_user_by_id(state.db.conn(), user_id).await else {
         return;
     };

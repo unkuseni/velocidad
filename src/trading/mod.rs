@@ -19,6 +19,32 @@ pub mod risk;
 
 pub use risk::RiskManager;
 
+/// Why a limit order was not filled on a tick.
+#[derive(Debug)]
+pub enum LimitFillError {
+    /// Transient: skip this tick; the order stays pending.
+    Skip(String),
+    /// Permanent: the order should be marked failed.
+    Fail(String),
+}
+
+impl std::fmt::Display for LimitFillError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LimitFillError::Skip(m) => write!(f, "skipped: {m}"),
+            LimitFillError::Fail(m) => write!(f, "failed: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for LimitFillError {}
+
+impl From<anyhow::Error> for LimitFillError {
+    fn from(e: anyhow::Error) -> Self {
+        LimitFillError::Fail(e.to_string())
+    }
+}
+
 /// Result of a filled order, ready to be rendered to the user.
 #[derive(Debug, Clone, Serialize)]
 pub struct TradeReceipt {
@@ -77,7 +103,10 @@ impl TradingEngine {
         let quantity = amount_native / price;
 
         let conn = db.conn();
-        let tx = conn.transaction().await?;
+        let tx = conn
+            .transaction()
+            .await
+            .map_err(|e| LimitFillError::Fail(e.to_string()))?;
         repo::add_to_position(
             &tx,
             user_id,
@@ -107,7 +136,7 @@ impl TradingEngine {
         )
         .await?;
         let alerts_fired =
-            repo::trigger_satisfied_alerts(&tx, user_id, token_address, price).await?;
+            repo::trigger_satisfied_alerts(&tx, user_id, chain.id, token_address, price).await?;
         tx.commit().await?;
 
         self.receipt(conn, order_id, token_address, Some(0.0), quote.source)
@@ -168,7 +197,7 @@ impl TradingEngine {
         )
         .await?;
         let alerts_fired =
-            repo::trigger_satisfied_alerts(&tx, user_id, token_address, price).await?;
+            repo::trigger_satisfied_alerts(&tx, user_id, chain.id, token_address, price).await?;
         tx.commit().await?;
 
         let mut receipt = self
@@ -220,37 +249,88 @@ impl TradingEngine {
 
     /// Fill a pending limit order at the current market price (called by the
     /// limit-order matcher worker). Updates the original order row in place.
-    pub async fn fill_limit(&self, db: &Db, chain: &Chain, order: &Order) -> Result<TradeReceipt> {
+    ///
+    /// Returns LimitFillError::Skip for transient conditions (no live price,
+    /// price above the limit, already filled) so the order stays pending, and
+    /// LimitFillError::Fail for permanent problems.
+    pub async fn fill_limit(
+        &self,
+        db: &Db,
+        chain: &Chain,
+        order: &Order,
+    ) -> std::result::Result<TradeReceipt, LimitFillError> {
         let quote = self.market.quote(chain, &order.token_address).await;
         let price = quote.price_native;
         if price <= 0.0 {
-            bail!("no valid price for this token on {}", chain.id);
+            return Err(LimitFillError::Skip(format!(
+                "no valid price for this token on {}",
+                chain.id
+            )));
         }
         if quote.source == "simulator" {
-            bail!("no live price for this token — refusing to fill at a simulated price");
+            return Err(LimitFillError::Skip(
+                "no live price for this token — refusing to fill at a simulated price".to_string(),
+            ));
+        }
+        // Re-check against the user's limit with the freshest quote: the
+        // worker trigger can be up to a tick (~15s) stale.
+        if let Some(limit) = order.price {
+            if price > limit {
+                return Err(LimitFillError::Skip(format!(
+                    "price {} above the limit {} — waiting",
+                    price, limit
+                )));
+            }
         }
         let amount = order.amount_in.unwrap_or(0.0);
         if amount <= 0.0 {
-            bail!("limit order has no amount_in");
+            return Err(LimitFillError::Fail(
+                "limit order has no amount_in".to_string(),
+            ));
         }
         let quantity = amount / price;
 
         let conn = db.conn();
-        let tx = conn.transaction().await?;
-        repo::add_to_position(
-            &tx,
-            order.user_id,
-            order.wallet_id,
-            chain.id,
-            &order.token_address,
-            quantity,
-            price,
-        )
-        .await?;
-        repo::execute_pending_order(&tx, order.id, quantity, price, "paper").await?;
-        let alerts_fired =
-            repo::trigger_satisfied_alerts(&tx, order.user_id, &order.token_address, price).await?;
-        tx.commit().await?;
+        let tx = conn
+            .transaction()
+            .await
+            .map_err(|e| LimitFillError::Fail(e.to_string()))?;
+        let res = async {
+            repo::add_to_position(
+                &tx,
+                order.user_id,
+                order.wallet_id,
+                chain.id,
+                &order.token_address,
+                quantity,
+                price,
+            )
+            .await?;
+            let affected =
+                repo::execute_pending_order(&tx, order.id, quantity, price, "paper").await?;
+            if affected == 0 {
+                // Another tick already filled this order.
+                return Err(LimitFillError::Skip("already filled".to_string()));
+            }
+            let alerts_fired = repo::trigger_satisfied_alerts(
+                &tx,
+                order.user_id,
+                chain.id,
+                &order.token_address,
+                price,
+            )
+            .await?;
+            tx.commit()
+                .await
+                .map_err(|e| LimitFillError::Fail(e.to_string()))?;
+            Ok::<_, LimitFillError>(alerts_fired)
+        }
+        .await;
+
+        let alerts_fired = match res {
+            Ok(fired) => fired,
+            Err(e) => return Err(e),
+        };
 
         self.receipt(
             conn,
@@ -264,6 +344,7 @@ impl TradingEngine {
             r.alerts_fired = alerts_fired;
             r
         })
+        .map_err(|e| LimitFillError::Fail(e.to_string()))
     }
 
     /// Build a human/API-friendly receipt from a stored order row.

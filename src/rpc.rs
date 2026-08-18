@@ -236,6 +236,8 @@ impl RpcClient {
     }
 
     /// ERC20 decimals() value; falls back to 18 when the call fails.
+    /// The fallback is loud: a wrong decimals guess makes quantities off by
+    /// orders of magnitude, so it must never happen silently.
     pub async fn erc20_decimals(&self, chain: &Chain, token: &str) -> u8 {
         let data = "0x313ce567";
         match self
@@ -246,8 +248,21 @@ impl RpcClient {
             )
             .await
         {
-            Ok(v) => hex_u128(v).unwrap_or(18) as u8,
-            Err(_) => 18,
+            Ok(v) => match hex_u128(v) {
+                Ok(d) => d as u8,
+                Err(_) => {
+                    tracing::warn!(
+                        chain = chain.id,
+                        token,
+                        "decimals() returned garbage — assuming 18"
+                    );
+                    18
+                }
+            },
+            Err(e) => {
+                tracing::warn!(chain = chain.id, token, error = %e, "decimals() failed — assuming 18");
+                18
+            }
         }
     }
     /// Resolve a token reference to an address: native/eth/empty means the

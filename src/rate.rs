@@ -38,12 +38,22 @@ impl RateLimiter {
         let mut map = self.hits.lock().unwrap();
         let entry = map.entry(key.to_string()).or_default();
         for (limit, window) in &self.windows {
-            let count = entry
-                .iter()
-                .filter(|t| now.duration_since(**t) < *window)
-                .count() as u64;
+            let mut oldest: Option<Instant> = None;
+            let mut count = 0u64;
+            for t in entry.iter() {
+                if now.duration_since(*t) < *window {
+                    count += 1;
+                    oldest = Some(oldest.map_or(*t, |o: Instant| o.min(*t)));
+                }
+            }
             if count >= *limit {
-                return Err(window.as_secs().max(1));
+                // Report the ACTUAL remaining wait (oldest hit expiry), not
+                // the whole window.
+                let remaining = match oldest {
+                    Some(o) => window.saturating_sub(now.duration_since(o)),
+                    None => *window,
+                };
+                return Err(remaining.as_secs().max(1));
             }
         }
         entry.push(now);
@@ -68,7 +78,11 @@ mod tests {
         assert!(rl.check("a").is_ok());
         assert!(rl.check("a").is_ok());
         assert!(rl.check("a").is_ok());
-        assert_eq!(rl.check("a"), Err(60));
+        // Denied with the ACTUAL remaining wait (<= the full window).
+        match rl.check("a") {
+            Err(secs) => assert!((1..=60).contains(&secs), "remaining {secs}s out of range"),
+            Ok(()) => panic!("expected denial"),
+        }
         // Other keys are unaffected.
         assert!(rl.check("b").is_ok());
     }
@@ -77,6 +91,9 @@ mod tests {
     fn shortest_window_wins() {
         let rl = RateLimiter::new(&[(1, Duration::from_secs(10)), (5, Duration::from_secs(60))]);
         assert!(rl.check("a").is_ok());
-        assert_eq!(rl.check("a"), Err(10));
+        match rl.check("a") {
+            Err(secs) => assert!((1..=10).contains(&secs), "remaining {secs}s out of range"),
+            Ok(()) => panic!("expected denial"),
+        }
     }
 }

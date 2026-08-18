@@ -44,6 +44,7 @@ pub struct SwapQuote {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct QuoteResponse {
     #[serde(default)]
     buy_amount: Option<String>,
@@ -85,6 +86,7 @@ struct QuoteBalance {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct QuoteTransaction {
     #[serde(default)]
     to: Option<String>,
@@ -104,6 +106,8 @@ struct QuoteError {
     #[allow(dead_code)]
     code: Option<String>,
     #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
     message: Option<String>,
     #[serde(default)]
     description: Option<String>,
@@ -116,9 +120,21 @@ struct QuoteError {
 /// commands never double-spend a nonce (which would drop one of the txs).
 /// Uses a tokio mutex so the guard may be held across the RPC fetch
 /// (std MutexGuard is !Send across await and would poison the caller futures).
-#[derive(Default)]
 pub struct NonceManager {
-    used: tokio::sync::Mutex<std::collections::HashMap<(String, String), u64>>,
+    used:
+        tokio::sync::Mutex<std::collections::HashMap<(String, String), (u64, std::time::Instant)>>,
+    /// Re-read the chain nonce after this long: a dropped/replaced tx would
+    /// otherwise leave the monotonic cache permanently above the chain nonce.
+    refetch_after: std::time::Duration,
+}
+
+impl Default for NonceManager {
+    fn default() -> Self {
+        Self {
+            used: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            refetch_after: std::time::Duration::from_secs(120),
+        }
+    }
 }
 
 impl NonceManager {
@@ -128,16 +144,27 @@ impl NonceManager {
 
     /// Next nonce for (chain, address): cached last-used + 1, or fetched from
     /// the RPC when this signer hasn't broadcast yet. Serialized per key.
+    ///
+    /// When the cache is stale (older than refetch_after) the RPC nonce is
+    /// re-read and max(cached, fetched) is used: this heals wallets whose
+    /// nonce drifted after a dropped/replaced tx while never reusing a nonce
+    /// that may still be in flight.
     pub async fn next(&self, rpc: &RpcClient, chain: &Chain, address: &str) -> anyhow::Result<u64> {
         let key = (chain.id.to_string(), address.to_lowercase());
         let mut guard = self.used.lock().await;
-        if let Some(last) = guard.get(&key) {
-            let n = last + 1;
-            guard.insert(key, n);
+        if let Some((last, at)) = guard.get(&key) {
+            if at.elapsed() < self.refetch_after {
+                let n = last + 1;
+                guard.insert(key, (n, std::time::Instant::now()));
+                return Ok(n);
+            }
+            let fetched = rpc.nonce(chain, address).await?;
+            let n = fetched.max(*last + 1);
+            guard.insert(key, (n, std::time::Instant::now()));
             return Ok(n);
         }
         let n = rpc.nonce(chain, address).await?;
-        guard.insert(key, n);
+        guard.insert(key, (n, std::time::Instant::now()));
         Ok(n)
     }
 
@@ -146,12 +173,16 @@ impl NonceManager {
     pub fn next_with(&self, chain: &Chain, address: &str, fetched: u64) -> u64 {
         let key = (chain.id.to_string(), address.to_lowercase());
         let mut guard = self.used.blocking_lock();
-        if let Some(last) = guard.get(&key) {
-            let n = last + 1;
-            guard.insert(key, n);
+        if let Some((last, at)) = guard.get(&key) {
+            let n = if at.elapsed() < self.refetch_after {
+                last + 1
+            } else {
+                fetched.max(*last + 1)
+            };
+            guard.insert(key, (n, std::time::Instant::now()));
             n
         } else {
-            guard.insert(key, fetched);
+            guard.insert(key, (fetched, std::time::Instant::now()));
             fetched
         }
     }
@@ -245,6 +276,7 @@ impl SwapClient {
                 if let Some(e) = err.error {
                     let msg = e
                         .message
+                        .or(e.reason)
                         .or(e.description)
                         .unwrap_or_else(|| "unknown 0x error".to_string());
                     anyhow::bail!("0x API {status}: {msg}");
@@ -269,6 +301,14 @@ impl SwapClient {
 
         let buy_amount = parse_quantity(parsed.buy_amount.as_deref().unwrap_or("0"))?;
         let sell_amount = parse_quantity(parsed.sell_amount.as_deref().unwrap_or("0"))?;
+        // Defense in depth: both amounts must be positive on a successful
+        // quote. A zero here means the API response shape drifted (this exact
+        // bug once silently zeroed every live fill).
+        if buy_amount == 0 || sell_amount == 0 {
+            anyhow::bail!(
+                "0x quote returned zero amounts (buy={buy_amount}, sell={sell_amount}) — API response shape mismatch"
+            );
+        }
         let min_buy_amount = parsed
             .min_buy_amount
             .as_deref()
@@ -941,6 +981,50 @@ pub fn decode_address(addr: &str) -> anyhow::Result<Vec<u8>> {
 mod nonce_tests {
     use super::*;
     use crate::chains;
+
+    #[test]
+    fn parses_v2_quote_fixture() {
+        // Realistic 0x Swap API v2 response shape (camelCase) — a regression
+        // guard for the missing rename_all that silently zeroed every field.
+        let json = r#"{
+            "chainId": 1,
+            "price": "2777.911809635357",
+            "buyAmount": "196049947",
+            "sellAmount": "1000000000000000000",
+            "minBuyAmount": "192836741",
+            "liquidityAvailable": true,
+            "gas": "172800",
+            "gasPrice": "1000000000",
+            "allowanceTarget": null,
+            "issues": {
+                "allowance": {"spender": "0xdef1c0ded9bec7f1a1670819833240f027b25eff", "amount": "0"},
+                "balance": {"amount": "0"}
+            },
+            "transaction": {
+                "to": "0xdef1c0ded9bec7f1a1670819833240f027b25eff",
+                "data": "0x1234567890abcdef",
+                "gas": "172800",
+                "gasPrice": "1000000000",
+                "value": "0"
+            }
+        }"#;
+        let parsed: QuoteResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.buy_amount.as_deref(), Some("196049947"));
+        assert_eq!(parsed.sell_amount.as_deref(), Some("1000000000000000000"));
+        assert_eq!(parsed.min_buy_amount.as_deref(), Some("192836741"));
+        assert_eq!(parsed.liquidity_available, Some(true));
+        let tx = parsed.transaction.unwrap();
+        assert_eq!(tx.gas.as_deref(), Some("172800"));
+        assert_eq!(tx.gas_price.as_deref(), Some("1000000000"));
+        let spender = parsed
+            .issues
+            .and_then(|i| i.allowance)
+            .and_then(|a| a.spender);
+        assert_eq!(
+            spender.as_deref(),
+            Some("0xdef1c0ded9bec7f1a1670819833240f027b25eff")
+        );
+    }
 
     #[test]
     fn nonce_manager_increments_without_rpc() {

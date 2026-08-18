@@ -1,6 +1,7 @@
 //! Shared application state passed to the Telegram bot, HTTP API and workers.
 
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use crate::config::Config;
 use crate::crypto::Keyring;
@@ -25,6 +26,10 @@ pub struct AppState {
     pub config: Config,
     pub bot_rate: Arc<RateLimiter>,
     pub api_rate: Arc<RateLimiter>,
+    /// True while the Telegram bot task is running (readiness).
+    pub bot_alive: Arc<AtomicBool>,
+    /// Last tick of either background worker (readiness).
+    pub worker_heartbeat: Arc<Mutex<std::time::Instant>>,
 }
 
 impl AppState {
@@ -50,8 +55,22 @@ impl AppState {
                 config.api_rate_per_min,
                 std::time::Duration::from_secs(60),
             )])),
+            bot_alive: Arc::new(AtomicBool::new(false)),
+            worker_heartbeat: Arc::new(Mutex::new(std::time::Instant::now())),
             config,
         }
+    }
+
+    /// Whether a Telegram user may run operator-only commands.
+    pub fn is_admin(&self, telegram_id: i64) -> bool {
+        self.config
+            .admin_telegram_ids
+            .as_deref()
+            .map(|ids| {
+                ids.split(',')
+                    .any(|id| id.trim().parse::<i64>().ok() == Some(telegram_id))
+            })
+            .unwrap_or(false)
     }
 
     /// Resolve the user's default chain (falling back to config default).

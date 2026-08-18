@@ -207,9 +207,17 @@ impl SolanaClient {
     /// SPL mint decimals via getTokenSupply.
     pub async fn token_decimals(&self, chain: &Chain, mint: &str) -> Result<u8> {
         let v = self.rpc(chain, "getTokenSupply", json!([mint])).await?;
-        Ok(v.pointer("/value/decimals")
-            .and_then(|d| d.as_u64())
-            .unwrap_or(9) as u8)
+        match v.pointer("/value/decimals").and_then(|d| d.as_u64()) {
+            Some(d) => Ok(d as u8),
+            None => {
+                tracing::warn!(
+                    chain = chain.id,
+                    mint,
+                    "token decimals unavailable — assuming 9"
+                );
+                Ok(9)
+            }
+        }
     }
 
     /// Jupiter v6 quote. `input_mint`/`output_mint` are SPL mints (WSOL for
@@ -381,8 +389,10 @@ impl SolanaClient {
         if lamports == 0 {
             bail!("amount too small for a live swap");
         }
-        self.swap_flow(chain, WSOL, mint, lamports, slippage, wallet, seed, sponsor)
-            .await
+        self.swap_flow(
+            chain, WSOL, mint, lamports, slippage, wallet, seed, sponsor, false,
+        )
+        .await
     }
 
     /// Live sell: swap a token quantity for SOL.
@@ -404,8 +414,10 @@ impl SolanaClient {
         if amount == 0 {
             bail!("quantity too small for token decimals");
         }
-        self.swap_flow(chain, mint, WSOL, amount, slippage, wallet, seed, sponsor)
-            .await
+        self.swap_flow(
+            chain, mint, WSOL, amount, slippage, wallet, seed, sponsor, true,
+        )
+        .await
     }
 
     /// Shared swap pipeline: quote → swap tx → sign → broadcast → confirm.
@@ -419,6 +431,7 @@ impl SolanaClient {
         wallet: &str,
         seed: &[u8; 32],
         sponsor: Option<&SponsorCtx>,
+        sell: bool,
     ) -> Result<SolanaTradeResult> {
         let bps = (slippage * 10_000.0) as u16;
         let quote = self.quote(input_mint, output_mint, amount, bps).await?;
@@ -447,16 +460,36 @@ impl SolanaClient {
         };
         let sig = self.send_transaction(chain, &signed).await?;
         let success = self.wait_confirmation(chain, &sig).await;
-        // Effective price in SOL per token (for buys: inAmount/outAmount).
-        let price_native = quote.in_amount as f64 / quote.out_amount as f64;
+        // Direction-aware mapping (a regression guard for a field swap that
+        // made sells report token qty as SOL and vice versa).
+        let (token_amount, native_amount, price_native) =
+            direction_fields(quote.in_amount, quote.out_amount, sell);
         Ok(SolanaTradeResult {
             tx_signature: sig.clone(),
             success,
-            token_amount: quote.out_amount,
-            native_amount: quote.in_amount,
+            token_amount,
+            native_amount,
             price_native,
             explorer_link: format!("https://solscan.io/tx/{sig}"),
         })
+    }
+}
+
+/// Map (in_amount, out_amount) to (token, native, SOL-per-token price) based
+/// on direction: buys are WSOL→token, sells are token→WSOL.
+fn direction_fields(in_amount: u64, out_amount: u64, sell: bool) -> (u64, u64, f64) {
+    if sell {
+        (
+            in_amount,
+            out_amount,
+            out_amount as f64 / in_amount.max(1) as f64,
+        )
+    } else {
+        (
+            out_amount,
+            in_amount,
+            in_amount as f64 / out_amount.max(1) as f64,
+        )
     }
 }
 
@@ -695,15 +728,18 @@ pub fn build_sponsored_approve(
         6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133,
         237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
     ];
+    // Order matters: signers first, then WRITABLE non-signers, then
+    // read-only non-signers. The source token account is written by
+    // SPL Approve (delegate + delegated_amount), so it must be writable.
     let keys = vec![
         *sponsor,
         *owner,
-        TOKEN_PROGRAM,
         *source_token_account,
+        TOKEN_PROGRAM,
         *delegate,
     ];
     let header = [2u8, 0, 2];
-    let instructions = vec![approve_instruction(2, 3, 4, 1, amount)];
+    let instructions = vec![approve_instruction(3, 2, 4, 1, amount)];
     let m = SolanaMessage {
         header,
         keys: keys.clone(),
@@ -724,9 +760,9 @@ pub fn build_sponsored_revoke(
         6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133,
         237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
     ];
-    let keys = vec![*sponsor, *owner, TOKEN_PROGRAM, *source_token_account];
-    let header = [2u8, 0, 2];
-    let instructions = vec![revoke_instruction(2, 3, 1)];
+    let keys = vec![*sponsor, *owner, *source_token_account, TOKEN_PROGRAM];
+    let header = [2u8, 0, 1];
+    let instructions = vec![revoke_instruction(3, 2, 1)];
     let m = SolanaMessage {
         header,
         keys: keys.clone(),
@@ -796,6 +832,96 @@ mod tests {
     /// (owner=seed 1, payer=owner, fixed blockhash). We rebuild it with the
     /// sponsor (seed 2) as fee payer, dual-sign, and assert the exact result
     /// — cross-checked against Transaction.from() in node.
+    #[test]
+    fn direction_fields_buy_vs_sell() {
+        // buy: 1 SOL -> 1,000,000 tokens
+        let (t, n, p) = direction_fields(1_000_000_000, 1_000_000, false);
+        assert_eq!(t, 1_000_000);
+        assert_eq!(n, 1_000_000_000);
+        assert!((p - 1000.0).abs() < 1e-9);
+        // sell: 1,000,000 tokens -> 0.5 SOL
+        let (t, n, p) = direction_fields(1_000_000, 500_000_000, true);
+        assert_eq!(t, 1_000_000);
+        assert_eq!(n, 500_000_000);
+        assert!((p - 500.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sponsored_approve_writes_source_account() {
+        let sponsor = [1u8; 32];
+        let owner = [2u8; 32];
+        let source = [3u8; 32];
+        let delegate = [4u8; 32];
+        let (msg, signers) =
+            build_sponsored_approve(&owner, &source, &delegate, 100, &sponsor, &[7u8; 32]);
+        assert_eq!(signers, vec![sponsor, owner]);
+        // Header: 2 signers, 0 read-only signers, 2 read-only non-signers.
+        assert_eq!(&msg[0..3], &[2u8, 0, 2]);
+        let (count, clen) = decode_short_u16(&msg[3..]).unwrap();
+        assert_eq!(count, 5);
+        let mut keys = Vec::new();
+        for i in 0..count as usize {
+            let off = 3 + clen + i * 32;
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&msg[off..off + 32]);
+            keys.push(k);
+        }
+        assert_eq!(keys[0], sponsor);
+        assert_eq!(keys[1], owner);
+        // Writable non-signers are keys[2..3] — the SOURCE must be there.
+        assert_eq!(keys[2], source);
+        assert_eq!(keys[4], delegate);
+        // Instruction: program=3 (TOKEN_PROGRAM), accounts source=2,
+        // delegate=4, owner=1.
+        let mut pos = 3 + clen + 5 * 32 + 32;
+        let (icount, ilen) = decode_short_u16(&msg[pos..]).unwrap();
+        assert_eq!(icount, 1);
+        pos += ilen;
+        assert_eq!(msg[pos], 3);
+        pos += 1;
+        let (acount, alen) = decode_short_u16(&msg[pos..]).unwrap();
+        assert_eq!(acount, 3);
+        pos += alen;
+        assert_eq!(msg[pos], 2);
+        assert_eq!(msg[pos + 1], 4);
+        assert_eq!(msg[pos + 2], 1);
+    }
+
+    #[test]
+    fn sponsored_revoke_writes_source_account() {
+        let sponsor = [1u8; 32];
+        let owner = [2u8; 32];
+        let source = [3u8; 32];
+        let (msg, signers) = build_sponsored_revoke(&owner, &source, &sponsor, &[7u8; 32]);
+        assert_eq!(signers, vec![sponsor, owner]);
+        // Header: 2 signers, 0 read-only signers, 1 read-only non-signer.
+        assert_eq!(&msg[0..3], &[2u8, 0, 1]);
+        let (count, clen) = decode_short_u16(&msg[3..]).unwrap();
+        assert_eq!(count, 4);
+        let mut keys = Vec::new();
+        for i in 0..count as usize {
+            let off = 3 + clen + i * 32;
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&msg[off..off + 32]);
+            keys.push(k);
+        }
+        assert_eq!(keys[0], sponsor);
+        assert_eq!(keys[1], owner);
+        assert_eq!(keys[2], source);
+        // Instruction: program=3 (TOKEN_PROGRAM), accounts source=2, owner=1.
+        let mut pos = 3 + clen + 4 * 32 + 32;
+        let (icount, ilen) = decode_short_u16(&msg[pos..]).unwrap();
+        assert_eq!(icount, 1);
+        pos += ilen;
+        assert_eq!(msg[pos], 3);
+        pos += 1;
+        let (acount, alen) = decode_short_u16(&msg[pos..]).unwrap();
+        assert_eq!(acount, 2);
+        pos += alen;
+        assert_eq!(msg[pos], 2);
+        assert_eq!(msg[pos + 1], 1);
+    }
+
     #[test]
     fn sponsor_payer_rebuild_golden() {
         let owner_seed = [1u8; 32];

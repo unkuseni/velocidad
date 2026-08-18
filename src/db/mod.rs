@@ -216,6 +216,10 @@ impl Db {
         let conn = db
             .connect()
             .context("failed to acquire libSQL connection")?;
+        // Wait up to 5s for a busy database instead of failing immediately
+        // (worker + bot + API share one connection; deferred transactions can
+        // collide). Remote Turso may reject the pragma — ignore that.
+        let _ = conn.execute("PRAGMA busy_timeout = 5000", ()).await;
 
         let this = Self { conn };
         this.migrate().await?;

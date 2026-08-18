@@ -216,6 +216,7 @@ src/
 | `MASTER_KEY` | auto-generated | 64-hex AES key for wallet encryption (0x allowed) |
 | `BOT_RATE_PER_MIN` | `30` | max bot commands per user per minute (0 disables) |
 | `API_RATE_PER_MIN` | `120` | max API requests per IP per minute (0 disables) |
+| `ADMIN_TELEGRAM_IDS` | — | comma-separated operator Telegram IDs (gates /sponsor setup) |
 
 All vars can also be prefixed `VELOCIDAD_` (e.g. `VELOCIDAD_API_PORT`).
 
@@ -239,6 +240,18 @@ All vars can also be prefixed `VELOCIDAD_` (e.g. `VELOCIDAD_API_PORT`).
   tolerate partially-applied column additions.
 - Startup validates the configuration and logs warnings for likely
   misconfigurations (e.g. live mode without a 0x key).
+- The Telegram bot runs under a supervisor: a panic or error (e.g. an invalid
+  token) restarts it with exponential backoff, and `/health` reports
+  readiness (bot alive + worker heartbeat) so a dead bot is never silent.
+- `/sponsor setup` is operator-only (`ADMIN_TELEGRAM_IDS`); `/sponsor on`
+  verifies the delegation target is the actual sponsor account before
+  enabling sponsorship.
+- Live swaps that fail (or time out with unknown outcome) are recorded as
+  `failed` order rows with the tx hash — the ledger never silently drops a
+  broadcast.
+- Limit orders: fills are guarded against double execution, transient
+  no-live-price conditions defer (never cancel) the order, the fill price is
+  re-checked against the limit, and failures notify the user.
 
 ## Tests
 

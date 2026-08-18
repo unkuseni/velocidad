@@ -241,7 +241,7 @@ pub fn sponsor_deploy_data(sponsor_addr: &str) -> Result<Vec<u8>> {
 
 /// Calldata for SponsorAccount.execute(address target, uint256 value, bytes data).
 pub fn sponsor_execute_calldata(target: &str, value: u128, data: &[u8]) -> Result<Vec<u8>> {
-    let mut out = hex::decode("1cff79cd")?; // execute(address,uint256,bytes)
+    let mut out = hex::decode("b61d27f6")?; // execute(address,uint256,bytes)
     let t = crate::swap::decode_address(target)?;
     let mut arg = [0u8; 32];
     arg[12..].copy_from_slice(&t);
@@ -305,11 +305,39 @@ mod tests {
             &[0xaa, 0xbb],
         )
         .unwrap();
-        assert_eq!(&data[0..4], &[0x1c, 0xff, 0x79, 0xcd]);
+        assert_eq!(&data[0..4], &[0xb6, 0x1d, 0x27, 0xf6]);
         assert_eq!(
             &data[16..36],
             &hex::decode("1234567890abcdef1234567890abcdef12345678").unwrap()[..]
         );
         assert_eq!(&data[64..68], &[0u8, 0, 0, 5]);
+    }
+
+    #[test]
+    fn sponsor_selector_matches_embedded_bytecode() {
+        // Derive the dispatcher's selectors from the embedded bytecode and
+        // require the calldata builder to target one that actually exists.
+        let bc = hex::decode(SPONSOR_ACCOUNT_BYTECODE).unwrap();
+        let mut selectors: Vec<[u8; 4]> = Vec::new();
+        for i in 0..bc.len() - 5 {
+            if bc[i] == 0x80 && bc[i + 1] == 0x63 {
+                selectors.push([bc[i + 2], bc[i + 3], bc[i + 4], bc[i + 5]]);
+            }
+        }
+        assert!(
+            selectors.contains(&[0xb6, 0x1d, 0x27, 0xf6]),
+            "execute(address,uint256,bytes) missing from dispatcher"
+        );
+        assert!(
+            !selectors.contains(&[0x1c, 0xff, 0x79, 0xcd]),
+            "execute(address,bytes) is not implemented by SponsorAccount"
+        );
+        let data = sponsor_execute_calldata(
+            "0x1234567890abcdef1234567890abcdef12345678",
+            5,
+            &[0xaa, 0xbb],
+        )
+        .unwrap();
+        assert!(selectors.contains(&[data[0], data[1], data[2], data[3]]));
     }
 }

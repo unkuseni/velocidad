@@ -97,7 +97,6 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
     tracing::info!("telegram bot polling started");
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state])
-        .enable_ctrlc_handler()
         .build()
         .dispatch()
         .await;
@@ -182,7 +181,15 @@ fn rest_of_command(msg: &Message, command: &str) -> Option<String> {
 
 async fn unknown_message(bot: Bot, msg: Message, state: Arc<AppState>) -> ResponseResult<()> {
     if let Some(user) = msg.from.as_ref() {
-        if state.bot_rate.check(&format!("u{}", user.id.0)).is_err() {
+        // Separate budget: free-typing chat must not burn the trading quota.
+        if state
+            .bot_rate
+            .check(&format!("u{}:misc", user.id.0))
+            .is_err()
+        {
+            let _ = bot
+                .send_message(msg.chat.id, "⏳ Too many messages — slow down.")
+                .await;
             return Ok(());
         }
     }
@@ -214,7 +221,7 @@ async fn cmd_start(state: &AppState, msg: &Message) -> Result<String> {
         } else {
             ""
         },
-        state.config.database_url,
+        esc(&state.config.database_url),
         chain.display(),
         user_id,
         addr,
@@ -295,7 +302,7 @@ async fn cmd_wallet(state: &AppState, msg: &Message, arg: Option<String>) -> Res
         }
         Some(other) => Ok(format!(
             "Unknown wallet action <code>{}</code>.\nUse /wallet, /wallet new or /wallet import &lt;privkey&gt;.",
-            other
+            esc(other)
         )),
     }
 }
@@ -368,7 +375,10 @@ async fn cmd_balance(state: &AppState, msg: &Message, arg: Option<String>) -> Re
             match state.rpc.native_balance(chain, &wallet.address).await {
                 Ok(wei) => Some(wei as f64 / 1e18),
                 Err(e) => {
-                    s.push_str(&format!("⚠️ native balance unavailable: {e}\n"));
+                    s.push_str(&format!(
+                        "⚠️ native balance unavailable: {}\n",
+                        esc(&e.to_string())
+                    ));
                     None
                 }
             }
@@ -377,7 +387,10 @@ async fn cmd_balance(state: &AppState, msg: &Message, arg: Option<String>) -> Re
             match state.solana.balance(chain, &wallet.address).await {
                 Ok(lamports) => Some(lamports as f64 / 1e9),
                 Err(e) => {
-                    s.push_str(&format!("⚠️ SOL balance unavailable: {e}\n"));
+                    s.push_str(&format!(
+                        "⚠️ SOL balance unavailable: {}\n",
+                        esc(&e.to_string())
+                    ));
                     None
                 }
             }
@@ -407,7 +420,7 @@ async fn cmd_balance(state: &AppState, msg: &Message, arg: Option<String>) -> Re
                 s.push_str(&format!(
                     "🪙 {:.4} <b>{}</b> · <b>{}</b>\n",
                     amount,
-                    symbol,
+                    esc(symbol),
                     format_usd(*usd)
                 ));
             }
@@ -560,7 +573,7 @@ async fn cmd_sell(
     let slippage = user_slippage(state, user_id).await?;
 
     let position = repo::get_position(state.db.conn(), user_id, chain.id, &token).await?;
-    let live = !state.config.paper_trading;
+    let live = crate::exec::live_enabled(state, chain);
     let qty = if qty_arg == "all" || qty_arg == "max" {
         if live {
             match chain.kind {
@@ -718,7 +731,7 @@ async fn cmd_token(state: &AppState, msg: &Message, token_arg: &str) -> Result<S
         quote.txns_buy_24h,
         quote.txns_sell_24h,
         quote.fdv.map(format_usd).unwrap_or_else(|| "—".to_string()),
-        quote.dex.clone().unwrap_or_default(),
+        esc(&quote.dex.clone().unwrap_or_default()),
         short_addr(quote.pair_address.as_deref().unwrap_or_default()),
         quote.source,
         pair_link
@@ -787,7 +800,7 @@ async fn cmd_portfolio(state: &AppState, msg: &Message) -> Result<String> {
             chain_usd += value_usd;
             s.push_str(&format!(
                 "  <b>{}</b> <code>{}</code>\n    qty {} @ {} · value <b>{:.6} {}</b> · PnL {}\n",
-                quote.symbol,
+                esc(&quote.symbol),
                 short_addr(&p.token_address),
                 format_qty(p.quantity),
                 format_price(p.avg_price),
@@ -857,7 +870,9 @@ async fn cmd_trending(state: &AppState, msg: &Message) -> Result<String> {
             .unwrap_or_else(|| short_addr(&t.token_address));
         s.push_str(&format!(
             "<code>{}</code> <b>{}</b> — <code>{}</code>\n",
-            t.chain, label, t.token_address
+            t.chain,
+            esc(&label),
+            t.token_address
         ));
     }
     s.push_str("\nInspect any with /token &lt;chain:address&gt;");
@@ -930,9 +945,16 @@ async fn cmd_sponsor(state: &AppState, msg: &Message, arg: Option<String>) -> Re
         None | Some("status") => sponsorship_status(state, user_id, chain, &wallet).await,
         Some("on") => sponsorship_on(state, user_id, chain, &wallet, &secret).await,
         Some("off") => sponsorship_off(state, user_id, chain, &wallet, &secret).await,
-        Some("setup") => sponsorship_setup(state, chain).await,
+        Some("setup") => {
+            let from_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+            if !state.is_admin(from_id) {
+                return Ok("⛔ /sponsor setup is an operator action.".to_string());
+            }
+            sponsorship_setup(state, chain).await
+        }
         Some(other) => Ok(format!(
-            "Unknown /sponsor action <code>{other}</code>. Use: on · off · status · setup",
+            "Unknown /sponsor action <code>{}</code>. Use: on · off · status · setup",
+            esc(other)
         )),
     }
 }
@@ -960,15 +982,31 @@ async fn sponsorship_on(
                         .to_string(),
                 );
             }
-            // Already delegated?
-            if let Ok(Some(target)) = state.rpc.delegation_of(chain, &wallet.address).await {
-                repo::set_setting(state.db.conn(), user_id, &setting_key, "on").await?;
-                return Ok(format!(
-                    "✅ Already delegated to <code>{}</code> — sponsorship ON for {}.\nGas will be paid by <code>{}</code>.",
-                    short_addr(&target),
-                    chain.id,
-                    short_addr(sponsor_addr)
-                ));
+            // Already delegated to THIS sponsor account?
+            match state.rpc.delegation_of(chain, &wallet.address).await {
+                Ok(Some(target)) if target == account => {
+                    repo::set_setting(state.db.conn(), user_id, &setting_key, "on").await?;
+                    return Ok(format!(
+                        "✅ Already delegated to <code>{}</code> — sponsorship ON for {}.\nGas will be paid by <code>{}</code>.",
+                        short_addr(&target),
+                        chain.id,
+                        short_addr(sponsor_addr)
+                    ));
+                }
+                Ok(Some(target)) => {
+                    return Ok(format!(
+                        "⚠️ EOA is already delegated to <code>{}</code> — that is NOT the sponsor account.\nRun /sponsor off first, then /sponsor on.",
+                        short_addr(&target)
+                    ));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Ok(format!(
+                        "⚠️ Could not check delegation on {}: {}. Try again.",
+                        chain.id,
+                        esc(&e.to_string())
+                    ));
+                }
             }
             let hash = state
                 .swap
@@ -1054,16 +1092,32 @@ async fn sponsorship_off(
     let setting_key = format!("sponsor:{}", chain.id);
     match chain.kind {
         crate::chains::ChainKind::Evm => {
-            let hash = state
-                .swap
-                .clear_delegation(chain, &wallet.address, secret)
-                .await?;
-            repo::set_setting(state.db.conn(), user_id, &setting_key, "off").await?;
-            Ok(format!(
-                "🪪 Delegation cleared ({}). 🔗 {}",
-                chain.id,
-                chain.explorer_link(&hash)
-            ))
+            match state.rpc.delegation_of(chain, &wallet.address).await {
+                Ok(Some(_)) => {
+                    let hash = state
+                        .swap
+                        .clear_delegation(chain, &wallet.address, secret)
+                        .await?;
+                    repo::set_setting(state.db.conn(), user_id, &setting_key, "off").await?;
+                    Ok(format!(
+                        "🪪 Delegation cleared ({}). 🔗 {}",
+                        chain.id,
+                        chain.explorer_link(&hash)
+                    ))
+                }
+                Ok(None) => {
+                    repo::set_setting(state.db.conn(), user_id, &setting_key, "off").await?;
+                    Ok(format!(
+                        "🪪 No delegation set on {} — sponsorship OFF.",
+                        chain.id
+                    ))
+                }
+                Err(e) => Ok(format!(
+                    "⚠️ Could not check delegation on {}: {}. Try again.",
+                    chain.id,
+                    esc(&e.to_string())
+                )),
+            }
         }
         crate::chains::ChainKind::Solana => {
             let Some(sp) = state.solana.sponsor.as_ref() else {
@@ -1288,7 +1342,8 @@ async fn cmd_settings(state: &AppState, msg: &Message, arg: Option<String>) -> R
                     ))
                 }
                 other => Ok(format!(
-                    "Unknown setting <code>{other:?}</code>. Try: /settings slippage 0.05",
+                    "Unknown setting <code>{}</code>. Try: /settings slippage 0.05",
+                    esc(other.unwrap_or_default())
                 )),
             }
         }
@@ -1363,7 +1418,9 @@ async fn cmd_limit(
     let chain = parse_token_arg(token_arg, state.user_chain(user_id).await)?;
     let token = chain.1;
     let chain = chain.0;
-    let wallet = repo::get_default_wallet(state.db.conn(), user_id).await?;
+    let wallet = crate::exec::wallet_for_chain(state, user_id, chain)
+        .await
+        .ok();
     let order = state
         .engine
         .place_limit(
@@ -1382,7 +1439,8 @@ async fn cmd_limit(
          Token: <code>{}</code>\n\
          Buy at: <b>{}</b> (when price ≤ limit)\n\
          Amount: <b>{:.6} {}</b>\n\
-         ℹ️ A background worker fills it automatically and notifies you.",
+         ℹ️ A background worker fills it automatically and notifies you.\n\n\
+         🧪 Paper simulation for now — limit orders don't execute on-chain yet.",
         order.id,
         chain.id,
         short_addr(&token),
@@ -1446,7 +1504,7 @@ fn fmt_buy_paper(receipt: &crate::trading::TradeReceipt, chain: &Chain, side: &s
         side.to_uppercase(),
         chain.id,
         short_addr(&o.token_address),
-        receipt.token_symbol.clone().unwrap_or_default(),
+        esc(&receipt.token_symbol.clone().unwrap_or_default()),
         format_qty(o.amount_out.unwrap_or(0.0)),
         format_price(o.price.unwrap_or(0.0)),
         o.amount_in.unwrap_or(0.0),
@@ -1470,7 +1528,7 @@ fn fmt_sell_paper(receipt: &crate::trading::TradeReceipt, chain: &Chain) -> Stri
          Realized PnL: <b>{}</b>{}{}",
         chain.id,
         short_addr(&o.token_address),
-        receipt.token_symbol.clone().unwrap_or_default(),
+        esc(&receipt.token_symbol.clone().unwrap_or_default()),
         format_qty(o.amount_in.unwrap_or(0.0)),
         format_price(o.price.unwrap_or(0.0)),
         o.amount_out.unwrap_or(0.0),
@@ -1506,7 +1564,7 @@ fn checks_text(report: &TokenReport) -> String {
                 "{} <b>{}</b> — {}",
                 if c.passed { "✔" } else { "✖" },
                 c.name,
-                c.note
+                esc(&c.note)
             )
         })
         .collect::<Vec<_>>()
@@ -1534,10 +1592,13 @@ fn alert_note(fired: i64) -> String {
 /// line boundaries and each chunk is sent separately.
 async fn send_reply(bot: &Bot, chat_id: ChatId, text: &str) {
     for chunk in chunk_message(text, 4096) {
-        let _ = bot
+        if let Err(e) = bot
             .send_message(chat_id, chunk)
             .parse_mode(ParseMode::Html)
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, "reply send failed (message may be malformed HTML)");
+        }
     }
 }
 

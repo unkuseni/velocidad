@@ -60,8 +60,14 @@ pub async fn buy(
     slippage: f64,
     side: &str,
 ) -> Result<TradeOutcome> {
+    // One risk gate for every surface (bot + API, paper + live).
+    state
+        .engine
+        .risk
+        .validate_trade(chain, token, amount, slippage)?;
+
     // Paper fills on every chain kind when configured or when no backend exists.
-    if state.config.paper_trading || (chain.kind == ChainKind::Evm && !state.swap.enabled()) {
+    if !live_enabled(state, chain) {
         let receipt = state
             .engine
             .buy(
@@ -86,7 +92,7 @@ pub async fn buy(
             } else {
                 None
             };
-            let result = state
+            let result = match state
                 .solana
                 .buy(
                     chain,
@@ -97,8 +103,39 @@ pub async fn buy(
                     &secret,
                     sponsor,
                 )
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    record_failed_order(
+                        state,
+                        user_id,
+                        Some(wallet.id),
+                        chain,
+                        token,
+                        side,
+                        amount,
+                        receipt_hash_from_error(&msg).as_deref(),
+                        &msg,
+                    )
+                    .await?;
+                    return Err(e);
+                }
+            };
             if !result.success {
+                record_failed_order(
+                    state,
+                    user_id,
+                    Some(wallet.id),
+                    chain,
+                    token,
+                    side,
+                    amount,
+                    Some(&result.tx_signature),
+                    "swap failed on-chain",
+                )
+                .await?;
                 bail!("swap failed — tx {}", result.tx_signature);
             }
             let decimals = state.solana.token_decimals(chain, token).await.unwrap_or(9);
@@ -132,15 +169,45 @@ pub async fn buy(
                 bail!("amount too small for a live swap");
             }
             let sponsored = user_sponsorship(state, user_id, chain).await?;
-            let result = if sponsored {
-                sponsored_evm_buy(state, chain, wallet, token, amount_wei, slippage).await?
+            let result = match if sponsored {
+                sponsored_evm_buy(state, chain, wallet, token, amount_wei, slippage).await
             } else {
                 state
                     .swap
                     .buy_native(chain, token, amount_wei, slippage, &wallet.address, &secret)
-                    .await?
+                    .await
+            } {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    record_failed_order(
+                        state,
+                        user_id,
+                        Some(wallet.id),
+                        chain,
+                        token,
+                        side,
+                        amount,
+                        receipt_hash_from_error(&msg).as_deref(),
+                        &msg,
+                    )
+                    .await?;
+                    return Err(e);
+                }
             };
             if !result.success {
+                record_failed_order(
+                    state,
+                    user_id,
+                    Some(wallet.id),
+                    chain,
+                    token,
+                    side,
+                    amount,
+                    Some(&result.tx_hash),
+                    "swap reverted on-chain",
+                )
+                .await?;
                 bail!("swap reverted — tx {}", result.tx_hash);
             }
             let decimals = state.rpc.erc20_decimals(chain, token).await;
@@ -180,11 +247,13 @@ pub async fn sell(
     qty: f64,
     slippage: f64,
 ) -> Result<TradeOutcome> {
-    if qty <= 0.0 {
-        bail!("quantity must be positive");
-    }
+    // One risk gate for every surface (bot + API, paper + live).
+    state
+        .engine
+        .risk
+        .validate_trade(chain, token, qty, slippage)?;
 
-    if state.config.paper_trading || (chain.kind == ChainKind::Evm && !state.swap.enabled()) {
+    if !live_enabled(state, chain) {
         let receipt = state
             .engine
             .sell(
@@ -208,7 +277,7 @@ pub async fn sell(
             } else {
                 None
             };
-            let result = state
+            let result = match state
                 .solana
                 .sell(
                     chain,
@@ -219,8 +288,39 @@ pub async fn sell(
                     &secret,
                     sponsor,
                 )
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    record_failed_order(
+                        state,
+                        user_id,
+                        Some(wallet.id),
+                        chain,
+                        token,
+                        "sell",
+                        qty,
+                        receipt_hash_from_error(&msg).as_deref(),
+                        &msg,
+                    )
+                    .await?;
+                    return Err(e);
+                }
+            };
             if !result.success {
+                record_failed_order(
+                    state,
+                    user_id,
+                    Some(wallet.id),
+                    chain,
+                    token,
+                    "sell",
+                    qty,
+                    Some(&result.tx_signature),
+                    "swap failed on-chain",
+                )
+                .await?;
                 bail!("swap failed — tx {}", result.tx_signature);
             }
             let proceeds = result.native_amount as f64 / 1e9;
@@ -249,15 +349,45 @@ pub async fn sell(
         ChainKind::Evm => {
             let secret = wallet_secret(state, wallet)?;
             let sponsored = user_sponsorship(state, user_id, chain).await?;
-            let result = if sponsored {
-                sponsored_evm_sell(state, chain, wallet, token, qty, slippage).await?
+            let result = match if sponsored {
+                sponsored_evm_sell(state, chain, wallet, token, qty, slippage).await
             } else {
                 state
                     .swap
                     .sell_tokens(chain, token, qty, slippage, &wallet.address, &secret)
-                    .await?
+                    .await
+            } {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    record_failed_order(
+                        state,
+                        user_id,
+                        Some(wallet.id),
+                        chain,
+                        token,
+                        "sell",
+                        qty,
+                        receipt_hash_from_error(&msg).as_deref(),
+                        &msg,
+                    )
+                    .await?;
+                    return Err(e);
+                }
             };
             if !result.success {
+                record_failed_order(
+                    state,
+                    user_id,
+                    Some(wallet.id),
+                    chain,
+                    token,
+                    "sell",
+                    qty,
+                    Some(&result.tx_hash),
+                    "swap reverted on-chain",
+                )
+                .await?;
                 bail!("swap reverted — tx {}", result.tx_hash);
             }
             let proceeds = result.native_amount as f64 / 1e18;
@@ -551,7 +681,58 @@ pub async fn record_live_order(
         },
     )
     .await?;
-    let _ = repo::trigger_satisfied_alerts(&tx, user_id, token, price).await?;
+    let _ = repo::trigger_satisfied_alerts(&tx, user_id, chain.id, token, price).await?;
     tx.commit().await?;
+    Ok(())
+}
+/// Whether the chain executes real swaps (paper otherwise). Single source of
+/// truth shared by exec and the bot/API surfaces.
+pub fn live_enabled(state: &AppState, chain: &Chain) -> bool {
+    !state.config.paper_trading && !(chain.kind == ChainKind::Evm && !state.swap.enabled())
+}
+
+/// Extract a tx hash from receipt-timeout errors ("timed out waiting for
+/// receipt 0x…") so the audit trail can reference the broadcast even when
+/// the outcome is unknown.
+fn receipt_hash_from_error(msg: &str) -> Option<String> {
+    let tail = msg.split_whitespace().next_back()?;
+    if (tail.starts_with("0x") || tail.starts_with("0X")) && tail.len() >= 10 {
+        Some(tail.to_string())
+    } else {
+        None
+    }
+}
+
+/// Record a failed live swap as an order row (audit trail; the user sees the
+/// error, the ledger sees a failed row instead of nothing).
+async fn record_failed_order(
+    state: &AppState,
+    user_id: i64,
+    wallet_id: Option<i64>,
+    chain: &Chain,
+    token: &str,
+    side: &str,
+    amount: f64,
+    tx_hash: Option<&str>,
+    error: &str,
+) -> Result<()> {
+    repo::insert_order(
+        state.db.conn(),
+        &repo::NewOrder {
+            user_id,
+            wallet_id,
+            network: chain.id,
+            token_address: token,
+            side,
+            amount_in: Some(amount),
+            amount_out: None,
+            price: None,
+            slippage: 0.0,
+            status: "failed",
+            tx_hash,
+            error: Some(error),
+        },
+    )
+    .await?;
     Ok(())
 }

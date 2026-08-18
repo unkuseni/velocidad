@@ -63,10 +63,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         ))
         // Per-IP rate limit (outermost layer: checked before auth).
         .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit))
-        .with_state(state);
+        .with_state(state.clone());
 
-    // /health stays open for load balancers/probes.
-    Router::new().route("/health", get(health)).merge(api)
+    // /health stays open for load balancers/probes (readiness: bot + workers).
+    Router::new()
+        .route("/health", get(health))
+        .with_state(state)
+        .merge(api)
 }
 
 /// Rejects requests without a matching `Authorization: Bearer <API_KEY>` when
@@ -109,6 +112,7 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(crate::shutdown_signal())
     .await?;
     Ok(())
 }
@@ -120,7 +124,17 @@ async fn rate_limit(
     req: Request,
     next: Next,
 ) -> Response {
-    if let Err(retry) = state.api_rate.check(&format!("ip:{}", addr.ip())) {
+    // Behind a reverse proxy every client shares the peer IP; honor a
+    // trusted X-Forwarded-For when present (set by the proxy, not clients).
+    let ip = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| addr.ip().to_string());
+    if let Err(retry) = state.api_rate.check(&format!("ip:{ip}")) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("Retry-After", retry.to_string())],
@@ -145,12 +159,30 @@ fn fail(code: StatusCode, err: &anyhow::Error) -> ApiResult {
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn health() -> Json<serde_json::Value> {
-    Json(json!({
-        "status": "ok",
-        "service": "velocidad",
-        "time": chrono::Utc::now().to_rfc3339(),
-    }))
+async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+    let bot = state.bot_alive.load(std::sync::atomic::Ordering::Relaxed);
+    let last_tick = state
+        .worker_heartbeat
+        .lock()
+        .map(|hb| hb.elapsed().as_secs())
+        .unwrap_or(u64::MAX);
+    let workers_ok = last_tick < 120;
+    let status = if bot && workers_ok { "ok" } else { "degraded" };
+    let code = if status == "ok" {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(json!({
+            "status": status,
+            "service": "velocidad",
+            "bot": bot,
+            "workers_last_tick_secs": last_tick,
+            "time": chrono::Utc::now().to_rfc3339(),
+        })),
+    )
 }
 
 async fn chain_list() -> Json<serde_json::Value> {
@@ -257,19 +289,17 @@ async fn balances(
                 None => chains::by_id(&state.config.default_chain)
                     .unwrap_or_else(|| chains::by_id("ethereum").unwrap()),
             };
-            let wallet = match repo::get_default_wallet_for(state.db.conn(), user.id, chain.id)
-                .await
-            {
-                Ok(Some(w)) => w,
-                Ok(None) => match repo::get_default_wallet(state.db.conn(), user.id).await {
-                    Ok(Some(w)) => w,
-                    _ => {
-                        return ok(
-                            json!({ "telegram_id": telegram_id, "chain": chain.id, "balances": [] }),
-                        )
-                    }
-                },
-                Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, &e),
+            // Kind-aware: EVM chains use the EVM wallet, Solana the Solana one.
+            let wallet = match exec::wallet_for_chain(&state, user.id, chain).await {
+                Ok(w) => w,
+                Err(_) => {
+                    return ok(json!({
+                        "telegram_id": telegram_id,
+                        "chain": chain.id,
+                        "balances": [],
+                        "wallet": null,
+                    }))
+                }
             };
             let native_usd = state.market.native_price_usd(chain).await;
             let mut tokens: Vec<serde_json::Value> = Vec::new();
@@ -379,6 +409,25 @@ async fn create_trade(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TradeRequest>,
 ) -> ApiResult {
+    // ---- input validation (HTTP 400) ----
+    if !matches!(req.side.as_str(), "buy" | "snipe" | "sell") {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            &anyhow::anyhow!("unknown side '{}' (expected buy|sell|snipe)", req.side),
+        );
+    }
+    if !req.slippage.is_finite() || !(0.0..=0.5).contains(&req.slippage) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            &anyhow::anyhow!("slippage must be between 0 and 50%"),
+        );
+    }
+    if !req.amount.is_finite() || req.amount <= 0.0 {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            &anyhow::anyhow!("amount must be a positive number"),
+        );
+    }
     let result = async {
         let user = repo::get_or_create_user(state.db.conn(), req.telegram_id, None, None).await?;
         let chain = match req.chain.as_deref().and_then(chains::Chain::resolve) {
@@ -417,7 +466,8 @@ async fn create_trade(
                             .engine
                             .buy(&state.db, chain, user.id, None, &req.token_address, req.amount, req.slippage, &req.side)
                             .await?;
-                        Ok(json!({ "status": "filled", "mode": "paper", "chain": chain.id, "receipt": serde_json::to_value(&r)? }))
+                        let outcome = crate::exec::TradeOutcome::Paper(Box::new(r));
+                        Ok(json!({ "status": "filled", "chain": chain.id, "outcome": serde_json::to_value(&outcome)? }))
                     }
                 }
             }
@@ -431,7 +481,8 @@ async fn create_trade(
                         .engine
                         .sell(&state.db, chain, user.id, None, &req.token_address, req.amount, req.slippage)
                         .await?;
-                    Ok(json!({ "status": "filled", "mode": "paper", "chain": chain.id, "receipt": serde_json::to_value(&r)? }))
+                    let outcome = crate::exec::TradeOutcome::Paper(Box::new(r));
+                    Ok(json!({ "status": "filled", "chain": chain.id, "outcome": serde_json::to_value(&outcome)? }))
                 }
             },
             other => Err(anyhow::anyhow!("unknown side '{other}' (expected buy|sell|snipe)")),
@@ -441,8 +492,38 @@ async fn create_trade(
 
     match result {
         Ok(v) => ok(v),
-        Err(e) => fail(StatusCode::BAD_REQUEST, &e),
+        Err(e) => {
+            let msg = e.to_string();
+            let code = if is_validation_error(&msg) {
+                StatusCode::BAD_REQUEST
+            } else if msg.contains("honeypot") {
+                StatusCode::FORBIDDEN
+            } else {
+                // Backend failure (RPC, exchange, DB) — not a client error.
+                StatusCode::BAD_GATEWAY
+            };
+            fail(code, &e)
+        }
     }
+}
+
+/// Errors that describe a bad request rather than a backend failure.
+fn is_validation_error(msg: &str) -> bool {
+    [
+        "must be positive",
+        "exceeds max size",
+        "invalid token address",
+        "slippage must be",
+        "amount too small",
+        "quantity must be",
+        "too small for",
+        "create a wallet first",
+        "unknown side",
+        "invalid token",
+        "bad wallet",
+    ]
+    .iter()
+    .any(|frag| msg.contains(frag))
 }
 
 #[derive(Debug, Deserialize)]
@@ -480,9 +561,7 @@ async fn sponsor_status(
                     }
                 }
             };
-            let wallet = repo::get_default_wallet_for(state.db.conn(), user.id, chain.id)
-                .await
-                .unwrap_or(None);
+            let wallet = exec::wallet_for_chain(&state, user.id, chain).await.ok();
             let opt_in =
                 repo::get_setting(state.db.conn(), user.id, &format!("sponsor:{}", chain.id))
                     .await

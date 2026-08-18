@@ -13,6 +13,9 @@ readme = "README.md"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# Future utilities (catch_unwind for the bot supervisor)
+futures = "0.3"
+
 # Web API
 axum = { version = "0.7", features = ["ws"] }
 

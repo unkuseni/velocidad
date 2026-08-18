@@ -79,6 +79,11 @@ pub struct Config {
     /// Max HTTP API requests per IP per minute (sliding window; 0 disables).
     #[serde(default = "default_api_rate")]
     pub api_rate_per_min: u64,
+
+    /// Comma-separated Telegram user IDs allowed to run operator commands
+    /// (/sponsor setup). Empty = nobody.
+    #[serde(default)]
+    pub admin_telegram_ids: Option<String>,
 }
 
 fn default_chain() -> String {
@@ -128,6 +133,7 @@ impl Config {
                 "API_KEY",
                 "BOT_RATE_PER_MIN",
                 "API_RATE_PER_MIN",
+                "ADMIN_TELEGRAM_IDS",
             ]))
             .merge(Env::prefixed("VELOCIDAD_").split("_"))
             .extract()?;

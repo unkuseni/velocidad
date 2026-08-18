@@ -30,8 +30,8 @@ impl RiskManager {
         amount: f64,
         slippage: f64,
     ) -> Result<()> {
-        if amount <= 0.0 {
-            bail!("amount must be positive");
+        if !amount.is_finite() || amount <= 0.0 {
+            bail!("amount must be a positive number");
         }
         if amount > self.max_order_eth {
             bail!(
@@ -40,7 +40,7 @@ impl RiskManager {
                 chain.native
             );
         }
-        if slippage < 0.0 || slippage > self.max_slippage {
+        if !slippage.is_finite() || slippage < 0.0 || slippage > self.max_slippage {
             bail!(
                 "slippage must be between 0 and {}%",
                 self.max_slippage * 100.0

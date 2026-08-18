@@ -21,9 +21,12 @@ mod swap;
 mod trading;
 mod workers;
 
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
+use futures::FutureExt;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -56,18 +59,58 @@ async fn main() -> anyhow::Result<()> {
 
     workers::spawn(Arc::clone(&state));
 
-    // The Telegram bot runs as a task: if it dies (bad token, network split),
-    // the HTTP API and workers keep serving. Log the failure, don't crash.
+    // The Telegram bot runs as a supervised task: a panic (e.g. teloxide's
+    // invalid-token panic) or an error restarts it with exponential backoff.
+    // The HTTP API and workers keep serving meanwhile; /health reports the
+    // bot's readiness so operators see the failure instead of silence.
     let bot_state = Arc::clone(&state);
     tokio::spawn(async move {
-        match bot::run(bot_state).await {
-            Ok(()) => tracing::warn!("telegram bot stopped cleanly"),
-            Err(e) => tracing::error!(error = %e, "telegram bot terminated"),
+        let mut backoff = 2u64;
+        loop {
+            bot_state.bot_alive.store(true, AtomicOrdering::Relaxed);
+            let result = std::panic::AssertUnwindSafe(bot::run(Arc::clone(&bot_state)))
+                .catch_unwind()
+                .await;
+            match result {
+                Ok(Ok(())) => {
+                    tracing::warn!("telegram bot stopped cleanly");
+                    break;
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, backoff, "telegram bot terminated — restarting");
+                }
+                Err(_) => {
+                    tracing::error!(backoff, "telegram bot panicked — restarting");
+                }
+            }
+            bot_state.bot_alive.store(false, AtomicOrdering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(60);
         }
     });
 
     let api_port = state.config.api_port;
     api::serve(state, api_port)
         .await
-        .context("HTTP API terminated")
+        .context("HTTP API terminated")?;
+    tracing::info!("shutdown complete");
+    Ok(())
+}
+
+/// Resolve on Ctrl+C or SIGTERM so the HTTP API can drain gracefully.
+pub async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = term.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
 }
