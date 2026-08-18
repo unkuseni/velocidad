@@ -217,6 +217,16 @@ src/
 
 All vars can also be prefixed `VELOCIDAD_` (e.g. `VELOCIDAD_API_PORT`).
 
+## Hardening notes
+
+- Positions and tokens are scoped per `(network, address)` — the same token
+  address on different chains never merges (WETH on Optimism vs Base).
+- Transaction nonces are serialized per (chain, signer) so concurrent commands
+  can't double-spend a nonce.
+- API responses include `price_source` (`dexscreener` vs `simulator`); the bot
+  warns and the limit-order matcher refuses fills when no live price exists.
+- `API_KEY` bearer auth protects `/api/v1/*` (open dev mode with a warning).
+
 ## Tests
 
 ```bash
