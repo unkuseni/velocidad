@@ -28,8 +28,9 @@ pub fn spawn(state: Arc<AppState>) {
         Some(Bot::new(token))
     };
     tokio::spawn(limit_matcher(Arc::clone(&state), bot.clone()));
-    tokio::spawn(alert_poller(state, bot));
-    tracing::info!("background workers started (limits + alerts)");
+    tokio::spawn(alert_poller(Arc::clone(&state), bot.clone()));
+    tokio::spawn(lp_watcher(state, bot));
+    tracing::info!("background workers started (limits + alerts + lp watch)");
 }
 
 async fn limit_matcher(state: Arc<AppState>, bot: Option<Bot>) {
@@ -216,6 +217,72 @@ async fn batch_quotes(
         }
     }
     out
+}
+
+/// Watches for newly-created liquidity pools on user-watched chains and
+/// notifies subscribers (deduped in memory). Opt-in via /lp watch <chain> <min_usd>.
+async fn lp_watcher(state: Arc<AppState>, bot: Option<Bot>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // (user_id, chain, pair_address) seen before — bounded dedupe set.
+    let mut seen: std::collections::HashSet<(i64, String, String)> =
+        std::collections::HashSet::new();
+    loop {
+        interval.tick().await;
+        let Ok(watchers) = repo::list_lp_watchers(state.db.conn()).await else {
+            continue;
+        };
+        if watchers.is_empty() {
+            continue;
+        }
+        // Group watchers by chain; remember the lowest threshold per chain.
+        let mut by_chain: std::collections::HashMap<String, (f64, Vec<i64>)> =
+            std::collections::HashMap::new();
+        for (user_id, chain, min_usd) in &watchers {
+            let e = by_chain
+                .entry(chain.clone())
+                .or_insert((f64::MAX, Vec::new()));
+            e.0 = e.0.min(*min_usd);
+            e.1.push(*user_id);
+        }
+        for (network, (min_liq, users)) in by_chain {
+            let Some(chain) = chains::by_id(&network) else {
+                continue;
+            };
+            let pairs = state.market.new_pairs_on(chain).await;
+            for p in pairs {
+                if p.liquidity_usd < min_liq {
+                    continue;
+                }
+                for uid in &users {
+                    let key = (*uid, network.clone(), p.pair_address.clone());
+                    if !seen.insert(key.clone()) {
+                        continue;
+                    }
+                    notify(
+                        &bot,
+                        &state,
+                        *uid,
+                        format!(
+                            "🚀 <b>NEW POOL</b>: {} on {}\n\nToken: <code>{}</code>\nLiquidity: <b>{}</b> · 24h vol <b>{}</b>\n/scan {}:{}",
+                            esc(&p.symbol),
+                            chain.id,
+                            market::short_addr(&p.token_address),
+                            market::format_usd(p.liquidity_usd),
+                            market::format_usd(p.volume_24h_usd),
+                            chain.id,
+                            p.token_address
+                        ),
+                    )
+                    .await;
+                }
+            }
+        }
+        // Bound the dedupe set to the most recent 10k signals.
+        if seen.len() > 10_000 {
+            seen.clear();
+        }
+    }
 }
 
 /// Escape a string for Telegram HTML messages.

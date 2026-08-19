@@ -69,6 +69,8 @@ pub enum Command {
     Find(String),
     #[command(description = "top boosted tokens")]
     Boosts,
+    #[command(description = "LP suggestions & new-pool watch: /lp, /lp watch bsc 20000")]
+    Lp,
     #[command(description = "gas sponsorship: /sponsor, /sponsor on|off|setup|status")]
     Sponsor,
     #[command(description = "trading settings: /settings, /settings slippage 0.05")]
@@ -149,6 +151,10 @@ async fn dispatch_command(
         Command::Trending => cmd_trending(&state, &msg).await,
         Command::Find(q) => cmd_find(&state, &msg, &q).await,
         Command::Boosts => cmd_boosts(&state, &msg).await,
+        Command::Lp => {
+            let arg = rest_of_command(&msg, "/lp");
+            cmd_lp(&state, &msg, arg).await
+        }
         Command::Sponsor => {
             let arg = rest_of_command(&msg, "/sponsor");
             cmd_sponsor(&state, &msg, arg).await
@@ -1449,6 +1455,102 @@ async fn cmd_limit(
         chain.native
     ))
 }
+
+async fn cmd_lp(state: &AppState, msg: &Message, arg: Option<String>) -> Result<String> {
+    let user_id = ensure_user(state, msg).await?;
+    let arg = arg.as_deref().unwrap_or("suggest").trim().to_string();
+    if arg == "suggest" || arg.is_empty() {
+        return lp_suggestions_text(state).await;
+    }
+    let mut parts = arg.split_whitespace();
+    match parts.next() {
+        Some("watch") => {
+            let chain_arg = parts.next().unwrap_or("").to_string();
+            if chain_arg.is_empty() || chain_arg == "off" {
+                // /lp watch off — clear every chain for this user
+                let watched: Vec<String> = repo::list_setting_keys(state.db.conn(), user_id)
+                    .await?
+                    .into_iter()
+                    .filter(|k| k.starts_with("lp_watch:"))
+                    .collect();
+                for k in watched {
+                    let _ = repo::delete_setting(state.db.conn(), user_id, &k).await;
+                }
+                return Ok("💧 New-pool alerts OFF.".to_string());
+            }
+            let chain = crate::chains::Chain::resolve(&chain_arg)
+                .ok_or_else(|| anyhow::anyhow!("unknown chain '{}'", chain_arg))?;
+            let min_usd = match parts.next() {
+                Some(v) => v.parse::<f64>().map_err(|_| anyhow::anyhow!("min liquidity must be a number (USD)"))?,
+                None => 20_000.0,
+            };
+            if !min_usd.is_finite() || min_usd < 1_000.0 {
+                anyhow::bail!("min liquidity must be at least 1000 USD");
+            }
+            repo::set_setting(
+                state.db.conn(),
+                user_id,
+                &format!("lp_watch:{}", chain.id),
+                &min_usd.to_string(),
+            )
+            .await?;
+            Ok(format!(
+                "💧 New-pool alerts ON for <b>{}</b> — notify when a pool appears with ≥ {} liquidity.\nUse /lp watch off to stop.",
+                chain.id,
+                crate::market::format_usd(min_usd)
+            ))
+        }
+        Some("chains") => {
+            let watched = repo::list_setting_keys(state.db.conn(), user_id).await?;
+            let active: Vec<String> = watched
+                .into_iter()
+                .filter(|k| k.starts_with("lp_watch:"))
+                .map(|k| k.trim_start_matches("lp_watch:").to_string())
+                .collect();
+            if active.is_empty() {
+                Ok("💧 No chains watched. Try /lp watch bsc 20000".to_string())
+            } else {
+                Ok(format!(
+                    "💧 Watching: <b>{}</b>\n/lp watch off to stop.",
+                    active.join(", ")
+                ))
+            }
+        }
+        other => Ok(format!(
+            "Unknown /lp action <code>{}</code>.\nUse: suggest · watch &lt;chain&gt; &lt;min_usd&gt; · watch off · chains",
+            esc(other.unwrap_or_default())
+        )),
+    }
+}
+
+async fn lp_suggestions_text(state: &AppState) -> Result<String> {
+    let list = state.market.lp_suggestions().await;
+    if list.is_empty() {
+        return Ok(
+            "💧 No LP-worthy tokens right now — markets are thin or volatile.\nTry /lp watch bsc 20000 for new-pool alerts."
+                .to_string(),
+        );
+    }
+    let mut s = String::from("💧 <b>LP candidates</b> (liquidity-friendly, low IL risk)\n\n");
+    for t in list.iter().take(8) {
+        s.push_str(&format!(
+            "<b>{}</b> · {} · score <b>{}/100</b>\n  <code>{}</code>\n  {} — {}",
+            esc(&t.symbol),
+            t.chain,
+            t.score,
+            t.address,
+            t.reasons.join(", "),
+            crate::market::format_usd(t.liquidity_usd)
+        ));
+        s.push('\n');
+    }
+    s.push('\n');
+    s.push_str(
+        "⚠️ Scores rank <b>LP risk</b>, not token upside. Always /scan before providing liquidity.",
+    );
+    Ok(s)
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1661,6 +1763,7 @@ fn help_text() -> &'static str {
      🔬 /scan &lt;token&gt; — security scan\n\
      🔔 /alert &lt;token&gt; &lt;above|below&gt; &lt;price&gt; — price alert\n\
      🔥 /trending — trending tokens\n\
+     💧 /lp — LP suggestions · /lp watch &lt;chain&gt; &lt;min_usd&gt; — new-pool alerts\n\
      🚀 /boosts — top boosted tokens\n\
      🔍 /find &lt;ticker&gt; — search tokens by name/symbol\n\
      💰 /balance — on-chain balances\n\

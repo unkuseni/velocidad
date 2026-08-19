@@ -543,6 +543,153 @@ impl MarketData {
             })
             .collect()
     }
+
+    /// Recently-launched pairs on a chain (launchpad feed). Uses the
+    /// token-profiles feed (the same source as /trending, cached 5 min) and
+    /// enriches each profile with its live quote.
+    pub async fn new_pairs_on(&self, chain: &Chain) -> Vec<NewPair> {
+        let profiles = self.trending().await;
+        let tokens: Vec<String> = profiles
+            .iter()
+            .filter(|p| p.chain == chain.id)
+            .map(|p| p.token_address.clone())
+            .collect();
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        let quotes = self.quotes_batch(chain, &tokens).await;
+        let now = chrono::Utc::now().timestamp();
+        let mut out = Vec::new();
+        for p in profiles.iter().filter(|p| p.chain == chain.id) {
+            let Some(q) = quotes.get(&p.token_address.to_lowercase()) else {
+                continue;
+            };
+            let age_secs = q.pair_created_at.map(|t| now - t);
+            if let Some(age) = age_secs {
+                if !(0..=24 * 3600).contains(&age) {
+                    continue;
+                }
+            }
+            out.push(NewPair {
+                chain: chain.id.to_string(),
+                token_address: p.token_address.clone(),
+                symbol: q.symbol.clone(),
+                pair_address: q.pair_address.clone().unwrap_or_default(),
+                liquidity_usd: q.liquidity_usd,
+                volume_24h_usd: q.volume_24h_usd,
+                pair_age_secs: age_secs,
+            });
+        }
+        out.sort_by_key(|a| std::cmp::Reverse(a.liquidity_usd as u64));
+        out
+    }
+
+    /// LP-friendly token suggestions: newest DexScreener profiles scored by
+    /// liquidity depth, fee yield (volume/LP) and volatility (IL risk).
+    pub async fn lp_suggestions(&self) -> Vec<LpSuggestion> {
+        let profiles = self.trending().await;
+        if profiles.is_empty() {
+            return Vec::new();
+        }
+        // Group addresses per chain for batched quotes.
+        let mut by_chain: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for p in &profiles {
+            by_chain
+                .entry(p.chain.clone())
+                .or_default()
+                .push(p.token_address.clone());
+        }
+        let mut out: Vec<LpSuggestion> = Vec::new();
+        for (network, tokens) in by_chain {
+            let Some(chain) = crate::chains::by_id(&network) else {
+                continue;
+            };
+            let quotes = self.quotes_batch(chain, &tokens).await;
+            for p in profiles.iter().filter(|p| p.chain == network) {
+                let Some(q) = quotes.get(&p.token_address.to_lowercase()) else {
+                    continue;
+                };
+                if q.price_usd <= 0.0 || q.source == "simulator" {
+                    continue;
+                }
+                let (score, reasons) = lp_score(
+                    q.liquidity_usd,
+                    q.volume_24h_usd,
+                    q.price_change_24h,
+                    q.pair_created_at
+                        .map(|t| (chrono::Utc::now().timestamp() - t).max(0)),
+                );
+                if score < 25 {
+                    continue; // too thin / too volatile — not worth suggesting
+                }
+                out.push(LpSuggestion {
+                    chain: network.clone(),
+                    address: p.token_address.clone(),
+                    name: q.name.clone(),
+                    symbol: q.symbol.clone(),
+                    liquidity_usd: q.liquidity_usd,
+                    volume_24h_usd: q.volume_24h_usd,
+                    price_change_24h: q.price_change_24h,
+                    pair_age_days: q
+                        .pair_created_at
+                        .map(|t| (chrono::Utc::now().timestamp() - t) as f64 / 86400.0),
+                    score,
+                    reasons,
+                });
+            }
+        }
+        out.sort_by_key(|a| std::cmp::Reverse(a.score));
+        out.truncate(10);
+        out
+    }
+}
+
+/// Score an LP candidate 0-100: liquidity depth (40), fee yield via
+/// volume/LP ratio (25), pool age bonus (10) minus volatility (IL proxy, up
+/// to -25). Deterministic and unit-testable.
+pub fn lp_score(
+    liquidity_usd: f64,
+    volume_24h_usd: f64,
+    price_change_24h: f64,
+    pair_age_secs: Option<i64>,
+) -> (u8, Vec<String>) {
+    let mut score = 0.0;
+    let mut reasons = Vec::new();
+
+    if liquidity_usd >= 5_000.0 {
+        score += (liquidity_usd / 50_000.0 * 40.0).min(40.0);
+        reasons.push(format!("{:.0}k liq", liquidity_usd / 1000.0));
+    } else {
+        reasons.push(format!("thin: {:.0} liq", liquidity_usd));
+    }
+
+    if liquidity_usd >= 5_000.0 {
+        let ratio = volume_24h_usd / liquidity_usd * 100.0; // % of pool/day
+        score += (ratio / 25.0 * 25.0).min(25.0);
+        reasons.push(format!("{:.0}% daily vol/LP", ratio));
+    }
+
+    let age_days = pair_age_secs.map(|s| s as f64 / 86400.0);
+    match age_days {
+        Some(d) if d <= 7.0 => {
+            score += 10.0;
+            reasons.push(format!("new pool ({:.0}d)", d.max(0.0)));
+        }
+        Some(d) if d <= 30.0 => {
+            score += 5.0;
+            reasons.push(format!("{:.0}d old", d));
+        }
+        _ => {}
+    }
+
+    let vol = price_change_24h.abs();
+    score -= (vol / 50.0 * 25.0).min(25.0);
+    if vol > 30.0 {
+        reasons.push(format!("⚠️ {:.0}% 24h move (IL risk)", price_change_24h));
+    }
+
+    (score.clamp(0.0, 100.0) as u8, reasons)
 }
 
 /// Deterministic pseudo-random price for (chain, token), drifting ±2% every 5s.
@@ -626,6 +773,35 @@ pub struct BoostedToken {
     pub address: String,
     pub amount: f64,
     pub total_amount: f64,
+}
+
+/// A token worth providing liquidity for, scored for LP-friendliness
+/// (liquidity depth + fee yield vs impermanent-loss risk).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LpSuggestion {
+    pub chain: String,
+    pub address: String,
+    pub name: String,
+    pub symbol: String,
+    pub liquidity_usd: f64,
+    pub volume_24h_usd: f64,
+    pub price_change_24h: f64,
+    pub pair_age_days: Option<f64>,
+    /// 0-100, higher = better LP candidate.
+    pub score: u8,
+    pub reasons: Vec<String>,
+}
+
+/// A freshly created liquidity pool (DexScreener /latest/dex/pairs).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NewPair {
+    pub chain: String,
+    pub token_address: String,
+    pub symbol: String,
+    pub pair_address: String,
+    pub liquidity_usd: f64,
+    pub volume_24h_usd: f64,
+    pub pair_age_secs: Option<i64>,
 }
 
 impl MarketData {
@@ -744,6 +920,22 @@ impl MarketData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lp_score_ranks_sane_pools_higher() {
+        // Deep liquidity, strong fee yield, calm price: best candidate.
+        let (good, _) = lp_score(200_000.0, 60_000.0, 8.0, Some(3 * 86400));
+        assert!(good >= 60, "good pool scored {good}");
+        // Thin or wildly volatile pools score low.
+        let (thin, _) = lp_score(2_000.0, 500.0, 5.0, Some(86400));
+        assert!(thin < 25, "thin pool scored {thin}");
+        let (wild, _) = lp_score(200_000.0, 60_000.0, 120.0, Some(3 * 86400));
+        assert!(wild < good, "volatile pool should rank below calm");
+        // Scores are bounded.
+        let (max, _) = lp_score(5_000_000.0, 5_000_000.0, 0.0, Some(86400));
+        assert!(max <= 100);
+        assert!(lp_score(0.0, 0.0, 0.0, None).0 <= 100);
+    }
 
     #[test]
     fn parses_dexscreener_payload() {

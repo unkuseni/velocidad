@@ -600,6 +600,49 @@ pub async fn get_setting(conn: &Connection, user_id: i64, key: &str) -> Result<O
     }
 }
 
+/// All setting keys for a user (used by /lp watch off etc.).
+pub async fn list_setting_keys(conn: &Connection, user_id: i64) -> Result<Vec<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT key FROM settings WHERE user_id = ?1",
+            params![user_id],
+        )
+        .await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        out.push(row.get(0)?);
+    }
+    Ok(out)
+}
+
+/// All active LP watchers: (user_id, chain, min_liquidity_usd).
+pub async fn list_lp_watchers(conn: &Connection) -> Result<Vec<(i64, String, f64)>> {
+    let mut rows = conn
+        .query(
+            "SELECT user_id, key, value FROM settings WHERE key LIKE 'lp_watch:%'",
+            (),
+        )
+        .await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let key: String = row.get(1)?;
+        let chain = key.trim_start_matches("lp_watch:").to_string();
+        let min_usd: f64 = row.get(2).unwrap_or(20_000.0);
+        out.push((row.get(0)?, chain, min_usd));
+    }
+    Ok(out)
+}
+
+/// Delete a single setting (idempotent).
+pub async fn delete_setting(conn: &Connection, user_id: i64, key: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM settings WHERE user_id = ?1 AND key = ?2",
+        params![user_id, key],
+    )
+    .await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Background-worker helpers
 // ---------------------------------------------------------------------------

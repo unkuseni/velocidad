@@ -54,6 +54,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/search", get(token_search))
         .route("/api/v1/sponsor/:telegram_id", get(sponsor_status))
         .route("/api/v1/boosts", get(token_boosts))
+        .route("/api/v1/lp/suggest", get(lp_suggest))
+        .route("/api/v1/lp/latest", get(lp_latest))
         .route("/api/v1/alerts/:telegram_id", get(alerts))
         .route("/api/v1/alerts", post(create_alert))
         // Everything under /api/v1 requires the bearer token when configured.
@@ -602,6 +604,22 @@ async fn sponsor_status(
         ),
         Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
+}
+
+async fn lp_suggest(State(state): State<Arc<AppState>>) -> ApiResult {
+    ok(json!({ "suggestions": state.market.lp_suggestions().await }))
+}
+
+async fn lp_latest(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<TokenQuery>,
+) -> ApiResult {
+    let chain = match params.chain.as_deref().and_then(chains::Chain::resolve) {
+        Some(c) => c,
+        None => chains::by_id(&state.config.default_chain)
+            .unwrap_or_else(|| chains::by_id("ethereum").unwrap()),
+    };
+    ok(json!({ "chain": chain.id, "new_pairs": state.market.new_pairs_on(chain).await }))
 }
 
 async fn token_search(

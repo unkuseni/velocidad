@@ -32,6 +32,7 @@ background workers: limit-order matching + price-alert polling
 | 💰 On-chain balances | Native + token balances via public RPCs (EVM ERC-20, Solana SPL) (`/balance`) |
 | ⛽ Gas sponsorship | Opt-in: EIP-7702 delegation (EVM) + SPL delegate/fee-payer (Solana) — the operator's sponsor key pays your gas (`/sponsor`) |
 | 🔍 Token discovery | `/find <ticker>` (full-text search), `/trending`, `/boosts` (DexScreener feeds) |
+| 💧 LP signals | `/lp` — LP-friendly token scores (liquidity depth, fee yield, IL risk); `/lp watch bsc 20000` — new-pool launchpad alerts; API `/api/v1/lp/suggest`, `/api/v1/lp/latest?chain=x` |
 | 🌐 Web API | Axum REST API mirroring the bot (see below) |
 | 🗄️ Storage | **libSQL** — local SQLite file or remote **Turso** (same code path) |
 
@@ -80,6 +81,9 @@ safe.** Then open your bot in Telegram:
 /find pepe                   🔍 search tokens by ticker across chains
 /trending                    🔥 trending tokens
 /boosts                      🚀 top boosted tokens
+/lp                          💧 LP-friendly token suggestions
+/lp watch <chain> <min_usd>  🔔 new-pool launchpad alerts (e.g. /lp watch bsc 20000)
+/lp watch off / /lp chains   ❌ stop / list watches
 /balance                     💰 on-chain balances (EVM + Solana)
 /portfolio                   📂 positions + PnL with per-chain USD totals
 /settings slippage 0.10      ⚙️ slippage
