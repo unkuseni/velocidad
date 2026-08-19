@@ -30,6 +30,9 @@ pub struct AppState {
     pub bot_alive: Arc<AtomicBool>,
     /// Last tick of either background worker (readiness).
     pub worker_heartbeat: Arc<Mutex<std::time::Instant>>,
+    /// Idempotency-Key -> cached trade response (short TTL, pruned on write).
+    pub idempotency:
+        Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, serde_json::Value)>>>,
 }
 
 impl AppState {
@@ -57,6 +60,7 @@ impl AppState {
             )])),
             bot_alive: Arc::new(AtomicBool::new(false)),
             worker_heartbeat: Arc::new(Mutex::new(std::time::Instant::now())),
+            idempotency: Arc::new(Mutex::new(std::collections::HashMap::new())),
             config,
         }
     }

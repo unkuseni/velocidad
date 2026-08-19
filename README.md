@@ -84,6 +84,9 @@ safe.** Then open your bot in Telegram:
 /lp                          💧 LP-friendly token suggestions
 /lp watch <chain> <min_usd>  🔔 new-pool launchpad alerts (e.g. /lp watch bsc 20000)
 /lp watch off / /lp chains   ❌ stop / list watches
+/tp <token> <price|pct>     🎯 auto-sell when price rises to the level
+/sl <token> <price|pct>     🛟 auto-sell when price falls to the level (off clears)
+/cancel <id>                ❌ cancel a pending limit order or delete an alert
 /balance                     💰 on-chain balances (EVM + Solana)
 /portfolio                   📂 positions + PnL with per-chain USD totals
 /settings slippage 0.10      ⚙️ slippage
@@ -250,6 +253,16 @@ All vars can also be prefixed `VELOCIDAD_` (e.g. `VELOCIDAD_API_PORT`).
 - `/sponsor setup` is operator-only (`ADMIN_TELEGRAM_IDS`); `/sponsor on`
   verifies the delegation target is the actual sponsor account before
   enabling sponsorship.
+- Position protection: " + BT + "/tp" + BT + " / " + BT + "/sl" + BT + " set auto-sell levels (paper or live); a
+  background worker evaluates every 15 s and sells on trigger, never on
+  simulated prices, with retry-safe level handling.
+- Max-order sizing applies to BUYS (native spend); sells are bounded only by
+  what you hold — selling 100k units of a micro-cap no longer trips the 5
+  native order cap.
+- " + BT + "POST /api/v1/trades" + BT + " honors an " + BT + "Idempotency-Key" + BT + " header (60 s dedupe) so a
+  retried request can never double-execute a swap.
+- Offline security scans report " + BT + "unavailable" + BT + " instead of fabricating
+  liquidity/tax/honeypot verdicts from the address hash.
 - Live swaps that fail (or time out with unknown outcome) are recorded as
   `failed` order rows with the tx hash — the ledger never silently drops a
   broadcast.

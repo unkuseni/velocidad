@@ -717,6 +717,18 @@ pub fn format_price(price: f64) -> String {
     }
 }
 
+/// Human-friendly NATIVE price (no $ — used where the unit is ETH/BNB/SOL,
+/// so users never mistake native triggers for USD).
+pub fn format_native(price: f64) -> String {
+    if price >= 1.0 {
+        format!("{:.4}", price)
+    } else if price >= 0.001 {
+        format!("{:.6}", price)
+    } else {
+        format!("{:.10}", price)
+    }
+}
+
 /// Human-friendly USD amount.
 pub fn format_usd(usd: f64) -> String {
     if usd >= 1_000_000.0 {

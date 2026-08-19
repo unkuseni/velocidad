@@ -72,6 +72,8 @@ pub struct Position {
     pub avg_price: f64,
     pub realized_pnl: f64,
     pub updated_at: Option<String>,
+    pub tp_price: Option<f64>,
+    pub sl_price: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

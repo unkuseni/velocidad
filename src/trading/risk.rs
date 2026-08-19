@@ -29,11 +29,15 @@ impl RiskManager {
         token_address: &str,
         amount: f64,
         slippage: f64,
+        is_sell: bool,
     ) -> Result<()> {
         if !amount.is_finite() || amount <= 0.0 {
             bail!("amount must be a positive number");
         }
-        if amount > self.max_order_eth {
+        // Max-order size guards NATIVE spend on buys. Sells are bounded by
+        // what the user actually holds, so the cap must not apply (a token
+        // position can easily be worth more than 5 native).
+        if !is_sell && amount > self.max_order_eth {
             bail!(
                 "order exceeds max size of {} {}",
                 self.max_order_eth,

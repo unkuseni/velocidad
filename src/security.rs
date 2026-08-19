@@ -217,56 +217,23 @@ impl TokenScanner {
         }
     }
 
-    /// Offline fallback: deterministic address-derived heuristics.
+    /// Offline fallback: NO verdicts can be fabricated from an address hash —
+    /// a real scan needs market data, so the result honestly says "unknown".
     fn scan_simulated(&self, chain: &Chain, token: &str) -> TokenReport {
-        let seed = seed(token);
         let n = token.trim_start_matches("0x");
         let name = format!("Token {}", &n[..n.len().min(6)]);
         let symbol = format!("T{}", &n[n.len().saturating_sub(4)..]);
 
-        let liquidity_eth = 0.5 + (seed % 10_000) as f64 / 100.0;
-        let liquidity_ok = liquidity_eth >= 1.0;
-        let checks = vec![
-            CheckResult {
-                name: "Liquidity",
-                passed: liquidity_ok,
-                note: format!("{:.1} {} locked", liquidity_eth, chain.native),
-            },
-            CheckResult {
-                name: "Ownership renounced",
-                passed: !seed.is_multiple_of(3),
-                note: if seed.is_multiple_of(3) {
-                    "admin key still active"
-                } else {
-                    "renounced"
-                }
-                .to_string(),
-            },
-            CheckResult {
-                name: "Transfer tax",
-                passed: !seed.is_multiple_of(5),
-                note: if seed.is_multiple_of(5) {
-                    "suspicious buy/sell tax"
-                } else {
-                    "≤ 5%"
-                }
-                .to_string(),
-            },
-            CheckResult {
-                name: "Honeypot pattern",
-                passed: !seed.is_multiple_of(7),
-                note: if seed.is_multiple_of(7) {
-                    "can't sell — honeypot"
-                } else {
-                    "none detected"
-                }
-                .to_string(),
-            },
-        ];
+        let checks = vec![CheckResult {
+            name: "Live scan",
+            passed: false,
+            note: format!("offline — cannot verify {} without market data", chain.id),
+        }];
 
-        let failed = checks.iter().filter(|c| !c.passed).count();
-        let risk_score = (5 + failed as u64 * 20 + seed % 5).min(100) as u8;
-        let is_honeypot = seed.is_multiple_of(7);
+        // Unknown risk is treated as HIGH risk; the honeypot flag stays false
+        // (unknown is not a verdict, and the snipe gate must not block on noise).
+        let risk_score = 100;
+        let is_honeypot = false;
 
         TokenReport {
             address: token.to_string(),
@@ -276,7 +243,7 @@ impl TokenScanner {
             price_usd: 0.0,
             risk_score,
             is_honeypot,
-            liquidity_usd: liquidity_eth * chain.fallback_native_usd,
+            liquidity_usd: 0.0,
             checks,
             data_source: "simulator",
         }
@@ -317,15 +284,6 @@ struct HoneypotInfo {
     reason: Option<String>,
     buy_tax: f64,
     sell_tax: f64,
-}
-
-fn seed(token: &str) -> u64 {
-    let mut h: u64 = 0x9e3779b97f4a7c15;
-    for b in token.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
 }
 
 fn format_age(secs: i64) -> String {

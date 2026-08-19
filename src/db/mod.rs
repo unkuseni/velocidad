@@ -173,6 +173,13 @@ const MIGRATIONS: &[&str] = &[
     "#,
     r#"DROP TABLE IF EXISTS tokens;"#,
     r#"ALTER TABLE tokens_v2 RENAME TO tokens;"#,
+    // Take-profit / stop-loss per open position (native units, 0 = unset).
+    r#"
+    ALTER TABLE positions ADD COLUMN tp_price REAL DEFAULT 0;
+    "#,
+    r#"
+    ALTER TABLE positions ADD COLUMN sl_price REAL DEFAULT 0;
+    "#,
 ];
 
 /// Shared handle to the libSQL database. Cheap to clone (`Connection` is

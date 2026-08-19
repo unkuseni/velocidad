@@ -371,7 +371,7 @@ pub async fn get_position(
     let mut rows = conn
         .query(
             "SELECT id, user_id, wallet_id, token_address, network, quantity,
-                    avg_price, realized_pnl, updated_at
+                    avg_price, realized_pnl, updated_at, tp_price, sl_price
              FROM positions WHERE user_id = ?1 AND network = ?2 AND token_address = ?3",
             params![user_id, network, token_address],
         )
@@ -389,6 +389,8 @@ pub async fn get_position(
         avg_price: row.get(6)?,
         realized_pnl: row.get(7)?,
         updated_at: row.get(8)?,
+        tp_price: row.get(9)?,
+        sl_price: row.get(10)?,
     }))
 }
 
@@ -396,7 +398,7 @@ pub async fn list_positions(conn: &Connection, user_id: i64) -> Result<Vec<Posit
     let mut rows = conn
         .query(
             "SELECT id, user_id, wallet_id, token_address, network, quantity,
-                    avg_price, realized_pnl, updated_at
+                    avg_price, realized_pnl, updated_at, tp_price, sl_price
              FROM positions WHERE user_id = ?1 AND quantity > 0 ORDER BY id ASC",
             params![user_id],
         )
@@ -413,9 +415,75 @@ pub async fn list_positions(conn: &Connection, user_id: i64) -> Result<Vec<Posit
             avg_price: row.get(6)?,
             realized_pnl: row.get(7)?,
             updated_at: row.get(8)?,
+            tp_price: row.get(9)?,
+            sl_price: row.get(10)?,
         });
     }
     Ok(out)
+}
+
+/// Set take-profit / stop-loss levels for a position (native units; 0 clears).
+pub async fn set_position_tp_sl(
+    conn: &Connection,
+    user_id: i64,
+    network: &str,
+    token_address: &str,
+    tp_price: Option<f64>,
+    sl_price: Option<f64>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE positions SET tp_price = ?4, sl_price = ?5
+         WHERE user_id = ?1 AND network = ?2 AND token_address = ?3 AND quantity > 0",
+        params![
+            user_id,
+            network,
+            token_address,
+            tp_price.unwrap_or(0.0),
+            sl_price.unwrap_or(0.0)
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Open positions with an active TP or SL (background protection worker).
+pub async fn list_protected_positions(conn: &Connection) -> Result<Vec<Position>> {
+    let mut rows = conn
+        .query(
+            "SELECT id, user_id, wallet_id, token_address, network, quantity,
+                    avg_price, realized_pnl, updated_at, tp_price, sl_price
+             FROM positions
+             WHERE quantity > 0 AND (tp_price > 0 OR sl_price > 0)",
+            (),
+        )
+        .await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        out.push(Position {
+            id: row.get(0)?,
+            user_id: row.get(1)?,
+            wallet_id: row.get(2)?,
+            token_address: row.get(3)?,
+            network: row.get(4)?,
+            quantity: row.get(5)?,
+            avg_price: row.get(6)?,
+            realized_pnl: row.get(7)?,
+            updated_at: row.get(8)?,
+            tp_price: row.get(9)?,
+            sl_price: row.get(10)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Clear a position's TP/SL levels (after a protective fill).
+pub async fn clear_position_tp_sl(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE positions SET tp_price = 0, sl_price = 0 WHERE id = ?1",
+        params![id],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Add `qty` tokens at `price` to a position (weighted-average cost basis).
@@ -631,6 +699,28 @@ pub async fn list_lp_watchers(conn: &Connection) -> Result<Vec<(i64, String, f64
         out.push((row.get(0)?, chain, min_usd));
     }
     Ok(out)
+}
+
+/// Cancel a user's pending limit order; false when nothing matched.
+pub async fn cancel_pending_order(conn: &Connection, user_id: i64, id: i64) -> Result<bool> {
+    let n = conn
+        .execute(
+            "UPDATE orders SET status = 'cancelled' WHERE id = ?1 AND user_id = ?2 AND status = 'pending'",
+            params![id, user_id],
+        )
+        .await?;
+    Ok(n > 0)
+}
+
+/// Delete a user's alert; false when nothing matched.
+pub async fn delete_alert(conn: &Connection, user_id: i64, id: i64) -> Result<bool> {
+    let n = conn
+        .execute(
+            "DELETE FROM alerts WHERE id = ?1 AND user_id = ?2",
+            params![id, user_id],
+        )
+        .await?;
+    Ok(n > 0)
 }
 
 /// Delete a single setting (idempotent).

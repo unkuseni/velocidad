@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{HeaderMap, AUTHORIZATION};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -409,6 +409,7 @@ fn default_slippage() -> f64 {
 
 async fn create_trade(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<TradeRequest>,
 ) -> ApiResult {
     // ---- input validation (HTTP 400) ----
@@ -429,6 +430,20 @@ async fn create_trade(
             StatusCode::BAD_REQUEST,
             &anyhow::anyhow!("amount must be a positive number"),
         );
+    }
+    // Idempotency: a retry with the same key returns the SAME response
+    // instead of executing a second swap (deduped for 60s, pruned on write).
+    let idem_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty());
+    if let Some(key) = &idem_key {
+        let mut cache = state.idempotency.lock().unwrap();
+        cache.retain(|_, (at, _)| at.elapsed() < std::time::Duration::from_secs(60));
+        if let Some((_, resp)) = cache.get(key) {
+            return ok(resp.clone());
+        }
     }
     let result = async {
         let user = repo::get_or_create_user(state.db.conn(), req.telegram_id, None, None).await?;
@@ -493,7 +508,16 @@ async fn create_trade(
     .await;
 
     match result {
-        Ok(v) => ok(v),
+        Ok(v) => {
+            if let Some(key) = &idem_key {
+                state
+                    .idempotency
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), (std::time::Instant::now(), v.clone()));
+            }
+            ok(v)
+        }
         Err(e) => {
             let msg = e.to_string();
             let code = if is_validation_error(&msg) {

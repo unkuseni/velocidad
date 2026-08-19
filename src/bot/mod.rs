@@ -19,7 +19,7 @@ use crate::chains::{self, Chain};
 use crate::crypto;
 use crate::db::repo;
 use crate::exec::{self, sponsor_account_for, wallet_for_chain, wallet_secret};
-use crate::market::{format_price, format_qty, format_usd, short_addr};
+use crate::market::{format_native, format_price, format_qty, format_usd, short_addr};
 use crate::security::TokenReport;
 
 #[derive(BotCommands, Clone)]
@@ -71,6 +71,12 @@ pub enum Command {
     Boosts,
     #[command(description = "LP suggestions & new-pool watch: /lp, /lp watch bsc 20000")]
     Lp,
+    #[command(description = "take-profit: /tp <token> <price|pct|off>")]
+    Tp(String, String),
+    #[command(description = "stop-loss: /sl <token> <price|pct|off>")]
+    Sl(String, String),
+    #[command(description = "cancel a pending limit or alert: /cancel <id>")]
+    Cancel(i64),
     #[command(description = "gas sponsorship: /sponsor, /sponsor on|off|setup|status")]
     Sponsor,
     #[command(description = "trading settings: /settings, /settings slippage 0.05")]
@@ -155,6 +161,9 @@ async fn dispatch_command(
             let arg = rest_of_command(&msg, "/lp");
             cmd_lp(&state, &msg, arg).await
         }
+        Command::Tp(token, level) => cmd_tp_sl(&state, &msg, &token, &level, "tp").await,
+        Command::Sl(token, level) => cmd_tp_sl(&state, &msg, &token, &level, "sl").await,
+        Command::Cancel(id) => cmd_cancel(&state, &msg, id).await,
         Command::Sponsor => {
             let arg = rest_of_command(&msg, "/sponsor");
             cmd_sponsor(&state, &msg, arg).await
@@ -845,15 +854,21 @@ async fn cmd_history(state: &AppState, msg: &Message) -> Result<String> {
             .as_ref()
             .map(|t| format!(" · <code>{}</code>", short_addr(t)))
             .unwrap_or_default();
+        let err = o
+            .error
+            .as_ref()
+            .map(|e| format!(" · ❌ {}", esc(e)))
+            .unwrap_or_default();
         s.push_str(&format!(
-            "{icon} #<code>{}</code> <b>{}</b> {} <code>{}</code> {} · {}{}\n",
+            "{icon} #<code>{}</code> <b>{}</b> {} <code>{}</code> {} · {}{}{}\n",
             o.id,
             o.network,
             o.side.to_uppercase(),
             short_addr(&o.token_address),
             o.amount_in.map(|a| format!("{:.6}", a)).unwrap_or_default(),
             o.status,
-            tx
+            tx,
+            err
         ));
     }
     Ok(s)
@@ -1377,14 +1392,16 @@ async fn cmd_alert(
         "🔔 <b>Alert created</b> #<code>{}</code>\n\n\
          Chain: <b>{}</b>\n\
          Token: <code>{}</code>\n\
-         When price goes {cond} <b>{}</b>\n\
-         Current: <b>{}</b>\n\
+         When price goes {cond} <b>{}</b> {}\n\
+         Current: <b>{}</b> {}\n\
          ℹ️ You'll be notified automatically.",
         alert.id,
         chain.id,
         short_addr(&token),
-        format_price(price),
-        format_price(quote.price_native)
+        format_native(price),
+        chain.native,
+        format_native(quote.price_native),
+        chain.native
     ))
 }
 
@@ -1549,6 +1566,92 @@ async fn lp_suggestions_text(state: &AppState) -> Result<String> {
         "⚠️ Scores rank <b>LP risk</b>, not token upside. Always /scan before providing liquidity.",
     );
     Ok(s)
+}
+
+async fn cmd_tp_sl(
+    state: &AppState,
+    msg: &Message,
+    token_arg: &str,
+    level: &str,
+    kind: &str,
+) -> Result<String> {
+    let user_id = ensure_user(state, msg).await?;
+    let parsed = parse_token_arg(token_arg, state.user_chain(user_id).await)?;
+    let token = parsed.1;
+    let chain = parsed.0;
+    let position = repo::get_position(state.db.conn(), user_id, chain.id, &token)
+        .await?
+        .context("no open position for this token — buy first")?;
+    if position.quantity <= 0.0 {
+        anyhow::bail!("position is closed — nothing to protect");
+    }
+
+    let (tp, sl) = if level == "off" {
+        (None, None)
+    } else {
+        let value = if let Some(pct) = level.strip_suffix('%') {
+            let pct = pct
+                .parse::<f64>()
+                .context("percentage must be a number, e.g. 20%")?;
+            if !pct.is_finite() || pct <= 0.0 {
+                anyhow::bail!("percentage must be positive");
+            }
+            position.avg_price * (1.0 + pct / 100.0 * if kind == "tp" { 1.0 } else { -1.0 })
+        } else {
+            level
+                .parse::<f64>()
+                .context("level must be a price or a percentage like 20%")?
+        };
+        if !value.is_finite() || value <= 0.0 {
+            anyhow::bail!("level must be positive");
+        }
+        if kind == "tp" {
+            (Some(value), position.sl_price)
+        } else {
+            (position.tp_price, Some(value))
+        }
+    };
+
+    repo::set_position_tp_sl(state.db.conn(), user_id, chain.id, &token, tp, sl).await?;
+    let label = if kind == "tp" {
+        "Take-profit"
+    } else {
+        "Stop-loss"
+    };
+    let state_line = match (tp, sl) {
+        (Some(t), _) if kind == "tp" => format!(
+            "🎯 {label}: <b>{}</b> ({}% up)",
+            format_price(t),
+            (t / position.avg_price - 1.0) * 100.0
+        ),
+        (_, Some(s)) if kind == "sl" => format!(
+            "🛟 {label}: <b>{}</b> ({}% down)",
+            format_price(s),
+            (1.0 - s / position.avg_price) * 100.0
+        ),
+        _ => "🛡️ Protection OFF".to_string(),
+    };
+    Ok(format!(
+        "{} on <code>{}</code> ({})\nEntry: <b>{}</b>\n{}\nℹ️ The bot sells automatically when the price crosses the level.",
+        if kind == "tp" { "🎯" } else { "🛟" },
+        short_addr(&token),
+        chain.id,
+        format_price(position.avg_price),
+        state_line
+    ))
+}
+
+async fn cmd_cancel(state: &AppState, msg: &Message, id: i64) -> Result<String> {
+    let user_id = ensure_user(state, msg).await?;
+    if repo::cancel_pending_order(state.db.conn(), user_id, id).await? {
+        return Ok(format!(
+            "❌ Pending limit order #<code>{id}</code> cancelled."
+        ));
+    }
+    if repo::delete_alert(state.db.conn(), user_id, id).await? {
+        return Ok(format!("🗑️ Alert #<code>{id}</code> deleted."));
+    }
+    bail!("nothing to cancel: #<code>{id}</code> is not your pending limit order or alert");
 }
 
 // ---------------------------------------------------------------------------
@@ -1764,6 +1867,8 @@ fn help_text() -> &'static str {
      🔔 /alert &lt;token&gt; &lt;above|below&gt; &lt;price&gt; — price alert\n\
      🔥 /trending — trending tokens\n\
      💧 /lp — LP suggestions · /lp watch &lt;chain&gt; &lt;min_usd&gt; — new-pool alerts\n\
+     🎯 /tp &lt;token&gt; &lt;price|pct&gt; · 🛟 /sl &lt;token&gt; &lt;price|pct&gt; — auto-protect positions\n\
+     ❌ /cancel &lt;id&gt; — cancel a pending limit order or delete an alert\n\
      🚀 /boosts — top boosted tokens\n\
      🔍 /find &lt;ticker&gt; — search tokens by name/symbol\n\
      💰 /balance — on-chain balances\n\

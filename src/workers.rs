@@ -29,7 +29,8 @@ pub fn spawn(state: Arc<AppState>) {
     };
     tokio::spawn(limit_matcher(Arc::clone(&state), bot.clone()));
     tokio::spawn(alert_poller(Arc::clone(&state), bot.clone()));
-    tokio::spawn(lp_watcher(state, bot));
+    tokio::spawn(lp_watcher(Arc::clone(&state), bot.clone()));
+    tokio::spawn(position_protector(state, bot));
     tracing::info!("background workers started (limits + alerts + lp watch)");
 }
 
@@ -97,8 +98,8 @@ async fn match_limits(state: &AppState, bot: &Option<Bot>) -> anyhow::Result<usi
                         "⏳ <b>LIMIT ORDER FILLED</b>\n\nToken: <code>{}</code> ({})\nBuy at: <b>{}</b> (filled {})\nQty: <b>{}</b>\nSpent: <b>{:.6} {}</b>\n{}\n\n{}",
                         market::short_addr(&order.token_address),
                         esc(&receipt.token_symbol.clone().unwrap_or_default()),
-                        market::format_price(limit_price),
-                        market::format_price(price),
+                        crate::market::format_native(limit_price),
+                        crate::market::format_native(price),
                         market::format_qty(receipt.order.amount_out.unwrap_or(0.0)),
                         receipt.order.amount_in.unwrap_or(0.0),
                         chain.native,
@@ -283,6 +284,128 @@ async fn lp_watcher(state: Arc<AppState>, bot: Option<Bot>) {
             seen.clear();
         }
     }
+}
+
+/// Evaluates TP/SL-protected positions every 15s and sells automatically
+/// when a level is crossed (paper or live, per the user's mode).
+async fn position_protector(state: Arc<AppState>, bot: Option<Bot>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(15));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        if let Err(e) = protect_positions(&state, &bot).await {
+            tracing::warn!(error = %e, "position protector error");
+        }
+    }
+}
+
+async fn protect_positions(state: &AppState, bot: &Option<Bot>) -> anyhow::Result<usize> {
+    let positions = repo::list_protected_positions(state.db.conn()).await?;
+    if positions.is_empty() {
+        return Ok(0);
+    }
+    // Group tokens per chain for batched quotes.
+    let mut by_chain: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for p in &positions {
+        by_chain
+            .entry(p.network.clone())
+            .or_default()
+            .push(p.token_address.clone());
+    }
+    let mut quotes: std::collections::HashMap<(String, String), crate::market::TokenQuote> =
+        std::collections::HashMap::new();
+    for (network, tokens) in by_chain {
+        let Some(chain) = chains::by_id(&network) else {
+            continue;
+        };
+        for (t, q) in state.market.quotes_batch(chain, &tokens).await {
+            quotes.insert((network.clone(), t), q);
+        }
+    }
+
+    let mut acted = 0;
+    for pos in positions {
+        let Some(quote) = quotes.get(&(pos.network.clone(), pos.token_address.to_lowercase()))
+        else {
+            continue;
+        };
+        if quote.price_native <= 0.0 || quote.source == "simulator" {
+            continue; // never act on fabricated prices
+        }
+        let hit = match (pos.tp_price, pos.sl_price) {
+            (Some(tp), _) if tp > 0.0 && quote.price_native >= tp => Some("🎯 take-profit"),
+            (_, Some(sl)) if sl > 0.0 && quote.price_native <= sl => Some("🛟 stop-loss"),
+            _ => None,
+        };
+        let Some(kind) = hit else {
+            continue;
+        };
+        let Some(chain) = chains::by_id(&pos.network) else {
+            continue;
+        };
+        let wallet = match crate::exec::wallet_for_chain(state, pos.user_id, chain).await {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(user = pos.user_id, error = %e, "protection skipped — no wallet");
+                continue;
+            }
+        };
+        // Clear the levels BEFORE the sell so a retry doesn't double-sell.
+        let _ = repo::clear_position_tp_sl(state.db.conn(), pos.id).await;
+        let outcome = crate::exec::sell(
+            state,
+            chain,
+            pos.user_id,
+            &wallet,
+            &pos.token_address,
+            pos.quantity,
+            0.05,
+        )
+        .await;
+        match outcome {
+            Ok(o) => {
+                acted += 1;
+                let amount = o.qty();
+                notify(
+                    bot,
+                    state,
+                    pos.user_id,
+                    format!(
+                        "{} <b>position closed</b> — {} on {}
+
+Token: <code>{}</code>
+Qty: <b>{}</b> at <b>{}</b>
+Entry: <b>{}</b>
+{}",
+                        kind,
+                        chain.id,
+                        esc(&quote.symbol),
+                        market::short_addr(&pos.token_address),
+                        market::format_qty(amount),
+                        market::format_price(quote.price_native),
+                        market::format_price(pos.avg_price),
+                        tx_footer(chain, o.tx_hash().unwrap_or("paper"))
+                    ),
+                )
+                .await;
+            }
+            Err(e) => {
+                // Leave the position protected for the next tick.
+                let _ = repo::set_position_tp_sl(
+                    state.db.conn(),
+                    pos.user_id,
+                    &pos.network,
+                    &pos.token_address,
+                    pos.tp_price,
+                    pos.sl_price,
+                )
+                .await;
+                tracing::warn!(position = pos.id, error = %e, "protective sell failed");
+            }
+        }
+    }
+    Ok(acted)
 }
 
 /// Escape a string for Telegram HTML messages.

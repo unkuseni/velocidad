@@ -49,6 +49,26 @@ pub struct SolanaLive {
     pub sponsored: bool,
 }
 
+impl TradeOutcome {
+    /// Quantity filled (paper: amount_out; live: received qty).
+    pub fn qty(&self) -> f64 {
+        match self {
+            TradeOutcome::Paper(r) => r.order.amount_out.unwrap_or(0.0),
+            TradeOutcome::EvmLive(o) => o.qty,
+            TradeOutcome::SolanaLive(o) => o.qty,
+        }
+    }
+
+    /// Transaction hash when a real broadcast happened.
+    pub fn tx_hash(&self) -> Option<&str> {
+        match self {
+            TradeOutcome::Paper(r) => r.order.tx_hash.as_deref(),
+            TradeOutcome::EvmLive(o) => Some(&o.result.tx_hash),
+            TradeOutcome::SolanaLive(o) => Some(&o.result.tx_signature),
+        }
+    }
+}
+
 /// Execute a buy (or snipe) on `chain`. `side` is "buy" | "snipe".
 pub async fn buy(
     state: &AppState,
@@ -64,7 +84,7 @@ pub async fn buy(
     state
         .engine
         .risk
-        .validate_trade(chain, token, amount, slippage)?;
+        .validate_trade(chain, token, amount, slippage, false)?;
 
     // Paper fills on every chain kind when configured or when no backend exists.
     if !live_enabled(state, chain) {
@@ -251,7 +271,7 @@ pub async fn sell(
     state
         .engine
         .risk
-        .validate_trade(chain, token, qty, slippage)?;
+        .validate_trade(chain, token, qty, slippage, true)?;
 
     if !live_enabled(state, chain) {
         let receipt = state
