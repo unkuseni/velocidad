@@ -710,6 +710,12 @@ async fn create_alert(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AlertRequest>,
 ) -> ApiResult {
+    if !req.target_price.is_finite() || req.target_price <= 0.0 {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            &anyhow::anyhow!("target_price must be a positive number"),
+        );
+    }
     let result = async {
         let user = repo::get_or_create_user(state.db.conn(), req.telegram_id, None, None).await?;
         let cond = req.condition.to_lowercase();

@@ -1,5 +1,11 @@
 # Velocidad Trading Bot - Technical Architecture & Roadmap
 
+> ⚠️ STATUS: This document is a **roadmap** (aspirational targets like
+> PostgreSQL/Redis/K8s). The **actual implemented architecture** — libSQL/Turso,
+> teloxide long-polling, axum, DexScreener/0x/Jupiter, EIP-7702 sponsorship —
+> is documented in `README.md` and mirrors this roadmap only partially.
+>
+
 ## Overview
 
 Velocidad is a high-performance, multi-chain Telegram trading bot that combines features from Trojan, Axiom, Photon, and DexScreener with a comprehensive web interface. Built with Rust for backend reliability and TanStack (React) for frontend performance, this system provides real-time trading, market analysis, and portfolio management.

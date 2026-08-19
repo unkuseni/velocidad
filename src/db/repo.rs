@@ -701,6 +701,23 @@ pub async fn list_lp_watchers(conn: &Connection) -> Result<Vec<(i64, String, f64
     Ok(out)
 }
 
+/// Make one wallet the default (clears the previous default); false when
+/// the wallet id does not belong to the user.
+pub async fn set_default_wallet(conn: &Connection, user_id: i64, id: i64) -> Result<bool> {
+    conn.execute(
+        "UPDATE wallets SET is_default = 0 WHERE user_id = ?1",
+        params![user_id],
+    )
+    .await?;
+    let n = conn
+        .execute(
+            "UPDATE wallets SET is_default = 1 WHERE id = ?1 AND user_id = ?2",
+            params![id, user_id],
+        )
+        .await?;
+    Ok(n > 0)
+}
+
 /// Cancel a user's pending limit order; false when nothing matched.
 pub async fn cancel_pending_order(conn: &Connection, user_id: i64, id: i64) -> Result<bool> {
     let n = conn

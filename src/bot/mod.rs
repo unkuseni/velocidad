@@ -11,7 +11,9 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use teloxide::dispatching::{Dispatcher, HandlerExt, UpdateFilterExt};
 use teloxide::prelude::*;
-use teloxide::types::{ChatId, Message, ParseMode, Update};
+use teloxide::types::{
+    CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, Message, ParseMode, Update,
+};
 use teloxide::utils::command::BotCommands;
 
 use crate::app::AppState;
@@ -94,13 +96,17 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
     }
     let bot = Bot::new(token);
 
-    let handler = Update::filter_message()
+    let handler = dptree::entry()
         .branch(
-            dptree::entry()
-                .filter_command::<Command>()
-                .endpoint(dispatch_command),
+            Update::filter_message()
+                .branch(
+                    dptree::entry()
+                        .filter_command::<Command>()
+                        .endpoint(dispatch_command),
+                )
+                .branch(dptree::endpoint(unknown_message)),
         )
-        .branch(dptree::endpoint(unknown_message));
+        .branch(Update::filter_callback_query().endpoint(handle_callback));
 
     tracing::info!("telegram bot polling started");
     Dispatcher::builder(bot, handler)
@@ -108,6 +114,144 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
         .build()
         .dispatch()
         .await;
+    Ok(())
+}
+
+/// Quick-action buttons for a buy fill: partial sells + TP/SL presets.
+fn quick_sell_actions(chain: &crate::chains::Chain, token: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "Sell 25%".to_string(),
+            format!("sell|25|{}|{}", chain.id, token),
+        ),
+        (
+            "Sell 50%".to_string(),
+            format!("sell|50|{}|{}", chain.id, token),
+        ),
+        (
+            "Sell 100%".to_string(),
+            format!("sell|100|{}|{}", chain.id, token),
+        ),
+        (
+            "🎯 TP +20%".to_string(),
+            format!("tp|20|{}|{}", chain.id, token),
+        ),
+        (
+            "🛟 SL -20%".to_string(),
+            format!("sl|20|{}|{}", chain.id, token),
+        ),
+    ]
+}
+
+/// Send an inline-keyboard message with the given (label, callback_data) rows.
+async fn send_actions(bot: &Bot, chat: ChatId, actions: Vec<(String, String)>) {
+    let buttons: Vec<InlineKeyboardButton> = actions
+        .into_iter()
+        .map(|(label, data)| InlineKeyboardButton::callback(label, data))
+        .collect();
+    let rows: Vec<Vec<InlineKeyboardButton>> =
+        buttons.chunks(3).map(|chunk| chunk.to_vec()).collect();
+    let _ = bot
+        .send_message(chat, "⚡ Quick actions")
+        .reply_markup(InlineKeyboardMarkup::new(rows))
+        .await;
+}
+
+/// Handle inline-button taps: partial sells + TP/SL presets.
+async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> ResponseResult<()> {
+    let result: Result<String> = async {
+        let data = q.data.clone().context("callback has no data")?;
+        let mut parts = data.split('|');
+        let action = parts.next().context("empty callback data")?;
+        let user = repo::get_or_create_user(
+            state.db.conn(),
+            q.from.id.0 as i64,
+            q.from.username.as_deref(),
+            Some(q.from.first_name.as_str()),
+        )
+        .await?;
+        match action {
+            "sell" => {
+                let pct = parts
+                    .next()
+                    .and_then(|p| p.parse::<f64>().ok())
+                    .context("bad sell percentage")?;
+                let chain = parts
+                    .next()
+                    .and_then(crate::chains::Chain::resolve)
+                    .context("bad chain")?;
+                let token = parts.next().context("missing token")?;
+                let wallet = crate::exec::wallet_for_chain(&state, user.id, chain).await?;
+                let position = repo::get_position(state.db.conn(), user.id, chain.id, token)
+                    .await?
+                    .context("no open position for this token")?;
+                let qty = position.quantity * (pct / 100.0).clamp(0.0, 1.0);
+                if qty <= 0.0 {
+                    anyhow::bail!("position is closed");
+                }
+                let slippage = user_slippage(&state, user.id).await?;
+                let outcome =
+                    crate::exec::sell(&state, chain, user.id, &wallet, token, qty, slippage)
+                        .await?;
+                Ok(format!(
+                    "✅ Sold {:.0}% of <code>{}</code> — qty {}",
+                    pct,
+                    short_addr(token),
+                    format_qty(outcome.qty())
+                ))
+            }
+            "tp" | "sl" => {
+                let pct = parts
+                    .next()
+                    .and_then(|p| p.parse::<f64>().ok())
+                    .context("bad percentage")?;
+                if !pct.is_finite() || pct <= 0.0 {
+                    anyhow::bail!("percentage must be positive");
+                }
+                let chain = parts
+                    .next()
+                    .and_then(crate::chains::Chain::resolve)
+                    .context("bad chain")?;
+                let token = parts.next().context("missing token")?;
+                let position = repo::get_position(state.db.conn(), user.id, chain.id, token)
+                    .await?
+                    .context("no open position for this token")?;
+                let price = if action == "tp" {
+                    position.avg_price * (1.0 + pct / 100.0)
+                } else {
+                    position.avg_price * (1.0 - pct / 100.0)
+                };
+                let (tp, sl) = if action == "tp" {
+                    (Some(price), position.sl_price)
+                } else {
+                    (position.tp_price, Some(price))
+                };
+                repo::set_position_tp_sl(state.db.conn(), user.id, chain.id, token, tp, sl).await?;
+                Ok(format!(
+                    "{} set at <b>{}</b> for <code>{}</code>",
+                    if action == "tp" {
+                        "🎯 Take-profit"
+                    } else {
+                        "🛟 Stop-loss"
+                    },
+                    format_native(price),
+                    short_addr(token)
+                ))
+            }
+            other => anyhow::bail!("unknown action {other}"),
+        }
+    }
+    .await;
+
+    if let Some(m) = q.message.as_ref() {
+        let text = match &result {
+            Ok(t) => t.clone(),
+            Err(e) => format!("❌ {}", esc(&e.to_string())),
+        };
+        let chat = m.chat();
+        send_reply(&bot, chat.id, &text).await;
+    }
+    let _ = bot.answer_callback_query(q.id).await;
     Ok(())
 }
 
@@ -125,6 +269,11 @@ async fn dispatch_command(
             return Ok(());
         }
     }
+    // Quick-action buttons attached to buy fills (buy/snipe only).
+    let quick_token: Option<String> = match &cmd {
+        Command::Buy(t, _) | Command::Snipe(t, _) => Some(t.clone()),
+        _ => None,
+    };
     let reply = match cmd {
         Command::Start => cmd_start(&state, &msg).await,
         Command::Help => Ok(help_text().to_string()),
@@ -175,7 +324,15 @@ async fn dispatch_command(
     };
 
     match reply {
-        Ok(text) => send_reply(&bot, msg.chat.id, &text).await,
+        Ok(text) => {
+            send_reply(&bot, msg.chat.id, &text).await;
+            if let (Some(tok), Some(from)) = (&quick_token, msg.from.as_ref()) {
+                let chain = state.user_chain(from.id.0 as i64).await;
+                if let Ok((c, t)) = parse_token_arg(tok, chain) {
+                    send_actions(&bot, msg.chat.id, quick_sell_actions(c, &t)).await;
+                }
+            }
+        }
         Err(err) => {
             tracing::warn!(error = %err, "command failed");
             send_reply(&bot, msg.chat.id, &format!("❌ {}", esc(&err.to_string()))).await;
@@ -260,11 +417,11 @@ async fn cmd_wallet(state: &AppState, msg: &Message, arg: Option<String>) -> Res
                 let badge = if w.is_default { "⭐ " } else { "   " };
                 let icon = if w.network == "solana" { "🪐" } else { "⛓️" };
                 s.push_str(&format!(
-                    "{icon} {}{} <code>{}</code> · {}\n",
-                    badge, w.label, w.address, w.network
+                    "{icon} {}{} #<code>{}</code> <code>{}</code> · {}\n",
+                    badge, w.label, w.id, w.address, w.network
                 ));
             }
-            s.push_str("\nEVM wallets work on every EVM chain; Solana needs its own (/wallet new solana).");
+            s.push_str("\nEVM wallets work on every EVM chain; Solana needs its own (/wallet new solana).\nSwitch: /wallet use &lt;id&gt;");
             Ok(s)
         }
         Some(rest) if rest.starts_with("new") => {
@@ -293,6 +450,18 @@ async fn cmd_wallet(state: &AppState, msg: &Message, arg: Option<String>) -> Res
                      ⚠️ Store it safely — it is encrypted at rest with your master key.",
                     gw.address, gw.private_key_hex
                 ))
+            }
+        }
+        Some(rest) if rest.starts_with("use") => {
+            let id = rest
+                .trim_start_matches("use")
+                .trim()
+                .parse::<i64>()
+                .context("usage: /wallet use <id>")?;
+            if repo::set_default_wallet(state.db.conn(), user_id, id).await? {
+                Ok(format!("⭐ Wallet #<code>{id}</code> is now the default."))
+            } else {
+                bail!("wallet #<code>{id}</code> not found for your account");
             }
         }
         Some(rest) if rest.starts_with("import") => {
@@ -357,7 +526,15 @@ async fn cmd_chains(state: &AppState, msg: &Message) -> Result<String> {
 }
 async fn cmd_balance(state: &AppState, msg: &Message, arg: Option<String>) -> Result<String> {
     let user_id = ensure_user(state, msg).await?;
-    let chain = state.user_chain(user_id).await;
+    // /balance [chain] | /balance [wallet-id] — a chain argument overrides
+    // the user's default chain (previously silently ignored).
+    let chain: &'static crate::chains::Chain = match arg.as_deref() {
+        Some(a) if a.parse::<i64>().is_err() => match crate::chains::Chain::resolve(a) {
+            Some(c) => c,
+            None => state.user_chain(user_id).await,
+        },
+        _ => state.user_chain(user_id).await,
+    };
     let wallets = repo::list_wallets(state.db.conn(), user_id).await?;
     if wallets.is_empty() {
         return Ok("👛 Create a wallet first: /wallet new".to_string());
@@ -589,7 +766,7 @@ async fn cmd_sell(
 
     let position = repo::get_position(state.db.conn(), user_id, chain.id, &token).await?;
     let live = crate::exec::live_enabled(state, chain);
-    let qty = if qty_arg == "all" || qty_arg == "max" {
+    let qty = if qty_arg.eq_ignore_ascii_case("all") || qty_arg.eq_ignore_ascii_case("max") {
         if live {
             match chain.kind {
                 crate::chains::ChainKind::Evm => {

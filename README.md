@@ -87,6 +87,7 @@ safe.** Then open your bot in Telegram:
 /tp <token> <price|pct>     🎯 auto-sell when price rises to the level
 /sl <token> <price|pct>     🛟 auto-sell when price falls to the level (off clears)
 /cancel <id>                ❌ cancel a pending limit order or delete an alert
+/wallet use <id>            ⭐ switch the default wallet (ids shown in /wallet)
 /balance                     💰 on-chain balances (EVM + Solana)
 /portfolio                   📂 positions + PnL with per-chain USD totals
 /settings slippage 0.10      ⚙️ slippage
@@ -259,6 +260,8 @@ All vars can also be prefixed `VELOCIDAD_` (e.g. `VELOCIDAD_API_PORT`).
 - Max-order sizing applies to BUYS (native spend); sells are bounded only by
   what you hold — selling 100k units of a micro-cap no longer trips the 5
   native order cap.
+- Buy fills ship with inline **quick actions** (Sell 25/50/100%, TP +20%,
+  SL -20%) — one tap executes via the same protected path as the commands.
 - " + BT + "POST /api/v1/trades" + BT + " honors an " + BT + "Idempotency-Key" + BT + " header (60 s dedupe) so a
   retried request can never double-execute a swap.
 - Offline security scans report " + BT + "unavailable" + BT + " instead of fabricating
